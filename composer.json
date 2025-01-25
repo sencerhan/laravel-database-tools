@@ -1,6 +1,6 @@
 {
     "name": "sencerhan/laravel-db-tools",
-    "description": "Laravel veritabanı tablolarından migration ve seeder dosyaları oluşturmak için araçlar",
+    "description": "Generate Laravel migration and seeder files from existing database tables. Easily create migrations and seeders with a single command.",
     "type": "library",
     "license": "MIT",
     "authors": [
@@ -11,9 +11,9 @@
     ],
     "require": {
         "php": "^8.0",
-        "illuminate/support": "^8.0|^9.0|^10.0",
-        "illuminate/console": "^8.0|^9.0|^10.0",
-        "illuminate/database": "^8.0|^9.0|^10.0"
+        "illuminate/support": "^8.0|^9.0|^10.0|^11.0",
+        "illuminate/console": "^8.0|^9.0|^10.0|^11.0",
+        "illuminate/database": "^8.0|^9.0|^10.0|^11.0"
     },
     "autoload": {
         "psr-4": {
