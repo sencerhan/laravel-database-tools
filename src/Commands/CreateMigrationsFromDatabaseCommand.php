@@ -22,6 +22,32 @@ class CreateMigrationsFromDatabaseCommand extends Command
      */
     protected $description = 'Veritabanındaki tablolardan migration dosyaları oluştur';
 
-    // ... Diğer tüm metodlar ve özellikler buraya gelecek ...
-    // Önceki dosyanızdaki tüm içeriği buraya kopyalayın
+    protected $currentIndexes = null;
+    protected $currentTable = null;
+
+    public function handle()
+    {
+        $this->info("\nMigration oluşturma işlemi başlatılıyor...");
+
+        try {
+            $tables = $this->getTables();
+
+            if (empty($tables)) {
+                $this->warn('İşlenecek tablo bulunamadı!');
+                return Command::SUCCESS;
+            }
+
+            $this->processTables($tables);
+
+            $this->info("\nMigration oluşturma işlemi tamamlandı!");
+            return Command::SUCCESS;
+
+        } catch (\Exception $e) {
+            $this->error("\nBir hata oluştu: " . $e->getMessage());
+            $this->error($e->getTraceAsString());
+            return Command::FAILURE;
+        }
+    }
+
+    // ... Diğer tüm metodları da buraya ekleyin ...
 } 
