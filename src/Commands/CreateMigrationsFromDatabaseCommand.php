@@ -6,6 +6,23 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
+/**
+ * Generate migration files from existing database tables
+ * 
+ * Features:
+ * - Supports all MySQL column types including spatial types
+ * - Automatic detection of foreign keys
+ * - Handles unique and normal indexes
+ * - Native PHP 8.1+ enum support
+ * - Supports timestamps with CURRENT_TIMESTAMP
+ * - Auto-detects UUID, IP Address and MAC Address fields
+ * - Preserves column comments and defaults
+ * 
+ * Usage:
+ * php artisan migrations:from-database                      # All tables
+ * php artisan migrations:from-database --tables=users,posts # Specific tables
+ * php artisan migrations:from-database --without_tables=logs # Exclude tables
+ */
 class CreateMigrationsFromDatabaseCommand extends Command
 {
     /**
@@ -68,7 +85,6 @@ class CreateMigrationsFromDatabaseCommand extends Command
 
             $this->info("\nMigration creation process completed!");
             return Command::SUCCESS;
-
         } catch (\Exception $e) {
             $this->error("\nAn error occurred: " . $e->getMessage());
             $this->error($e->getTraceAsString());
@@ -76,17 +92,19 @@ class CreateMigrationsFromDatabaseCommand extends Command
         }
     }
 
-    protected function getTables(): array 
+    protected function getTables(): array
     {
-        $specifiedTables = $this->option('tables') 
+        $specifiedTables = $this->option('tables')
             ? explode(',', $this->option('tables'))
             : [];
-        $excludedTables = $this->option('without_tables') 
-            ? explode(',', $this->option('without_tables')) 
+        $excludedTables = $this->option('without_tables')
+            ? explode(',', $this->option('without_tables'))
             : [];
-        
+
         if (!empty($specifiedTables)) {
-            return array_filter($specifiedTables, fn($table) => 
+            return array_filter(
+                $specifiedTables,
+                fn($table) =>
                 $table !== 'migrations' && !in_array($table, $excludedTables)
             );
         }
@@ -112,13 +130,13 @@ class CreateMigrationsFromDatabaseCommand extends Command
 
         foreach ($tables as $table) {
             $this->info("\n[$current/$totalTables] Creating migration for '{$table}' table...");
-            
+
             try {
                 // Sütun bilgilerini al
                 $this->line("  - Getting column information...");
                 $columns = DB::select("SHOW FULL COLUMNS FROM `{$table}`");
                 $this->info("  ✓ Column information retrieved");
-                
+
                 // İndeks bilgilerini al
                 $this->line("  - Getting index information...");
                 $indexes = DB::select("SHOW INDEXES FROM `{$table}`");
@@ -128,7 +146,7 @@ class CreateMigrationsFromDatabaseCommand extends Command
                 $migrationContent = $this->generateMigrationContent($table, $columns, $indexes);
                 $fileName = $this->createMigrationFile($table, $migrationContent);
                 $this->info("  ✓ Migration file created");
-                
+
                 $this->info("  Success! Migration file created: {$fileName}");
             } catch (\Exception $e) {
                 $this->error("\n  ERROR! Failed to create migration for {$table} table: " . $e->getMessage());
@@ -144,10 +162,10 @@ class CreateMigrationsFromDatabaseCommand extends Command
         $this->currentIndexes = $indexes;
         // Tablo adını da saklayalım
         $this->currentTable = $table;
-        
+
         $schemaLines = [];
         $indexLines = [];
-        
+
         foreach ($columns as $column) {
             $line = $this->generateColumnDefinition($column);
             if ($line !== null) {
@@ -165,11 +183,11 @@ class CreateMigrationsFromDatabaseCommand extends Command
         }
 
         $allLines = array_merge($schemaLines, $indexLines);
-        
+
         // Temizlik yapalım
         $this->currentIndexes = null;
         $this->currentTable = null;
-        
+
         return $this->getMigrationTemplate($table, $allLines);
     }
 
@@ -226,28 +244,28 @@ class CreateMigrationsFromDatabaseCommand extends Command
         }
 
         $modifiersStr = implode('', $modifiers);
-        
+
         // Decimal için özel işlem ekleyelim
         if (str_contains($type, 'decimal,')) {
             $parts = explode(',', $type);
             return "\$table->decimal('{$column->Field}', " . trim($parts[1]) . ", " . trim($parts[2]) . "){$modifiersStr};";
         }
-        
+
         // VARCHAR için özel işlem
         if ($type === 'string') {
             preg_match('/varchar\((\d+)\)/', strtolower($column->Type), $matches);
             $length = $matches[1] ?? 255;
             return "\$table->string('{$column->Field}', {$length}){$modifiersStr};";
         }
-        
+
         return "\$table->{$type}('{$column->Field}'){$modifiersStr};";
     }
 
     protected function getColumnType($column)
     {
         $type = strtolower($column->Type);
-        
-        // Integer tipleri için Laravel standartları
+
+        // Integer types
         if (str_contains($type, 'int')) {
             if (str_contains($type, 'unsigned')) {
                 if (str_contains($type, 'tiny')) return 'unsignedTinyInteger';
@@ -262,8 +280,8 @@ class CreateMigrationsFromDatabaseCommand extends Command
             if (str_contains($type, 'big')) return 'bigInteger';
             return 'integer';
         }
-        
-        // Diğer tipler için Laravel standartları
+
+        // String & Text types
         if (str_contains($type, 'varchar')) return 'string';
         if (str_contains($type, 'char')) return 'char';
         if (str_contains($type, 'text')) {
@@ -272,30 +290,118 @@ class CreateMigrationsFromDatabaseCommand extends Command
             if (str_contains($type, 'long')) return 'longText';
             return 'text';
         }
-        if (str_contains($type, 'json')) return 'json';
-        if (str_contains($type, 'blob')) return 'binary';
+
+        // Binary types
+        if (str_contains($type, 'blob')) {
+            if (str_contains($type, 'tiny')) return 'binary';
+            if (str_contains($type, 'medium')) return 'mediumBinary';
+            if (str_contains($type, 'long')) return 'longBinary';
+            return 'binary';
+        }
+        if (str_contains($type, 'binary')) return 'binary';
+        if (str_contains($type, 'varbinary')) return 'binary';
+
+        // Date and Time types
         if (str_contains($type, 'timestamp')) return 'timestamp';
         if (str_contains($type, 'datetime')) return 'datetime';
         if (str_contains($type, 'date')) return 'date';
         if (str_contains($type, 'time')) return 'time';
         if (str_contains($type, 'year')) return 'year';
+
+        // Numeric types
         if (str_contains($type, 'decimal')) {
             preg_match('/decimal\((\d+),(\d+)\)/', $type, $matches);
             if (isset($matches[1], $matches[2])) {
-                return "decimal, {$matches[1]}, {$matches[2]}";  // String yerine parametre olarak gönderilecek
+                return "decimal, {$matches[1]}, {$matches[2]}";
             }
             return 'decimal';
         }
-        if (str_contains($type, 'float')) return 'float';
         if (str_contains($type, 'double')) return 'double';
-        if (str_contains($type, 'boolean')) return 'boolean';
+        if (str_contains($type, 'float')) return 'float';
+        if (str_contains($type, 'real')) return 'float';
+
+        // Boolean type
+        if (str_contains($type, 'bool') || str_contains($type, 'tinyint(1)')) return 'boolean';
+
+        // JSON type
+        if (str_contains($type, 'json')) return 'json';
+
+        // Spatial types
+        if (str_contains($type, 'geometry')) return 'geometry';
+        if (str_contains($type, 'point')) return 'point';
+        if (str_contains($type, 'linestring')) return 'lineString';
+        if (str_contains($type, 'polygon')) return 'polygon';
+        if (str_contains($type, 'multipoint')) return 'multiPoint';
+        if (str_contains($type, 'multilinestring')) return 'multiLineString';
+        if (str_contains($type, 'multipolygon')) return 'multiPolygon';
+        if (str_contains($type, 'geometrycollection')) return 'geometryCollection';
+
+        // Set & Enum types
         if (str_contains($type, 'enum')) {
             preg_match('/enum\((.*?)\)/', $type, $matches);
             $values = str_replace("'", '', $matches[1]);
-            return "enum('{$column->Field}', [{$values}])";
+
+            // Laravel 8+ native enum desteği için sınıf adı oluştur
+            $enumClassName = Str::studly(Str::singular($this->currentTable)) . Str::studly($column->Field) . 'Type';
+
+            // Enum değerlerini PHP enum formatına dönüştür
+            $enumValues = array_map('trim', explode(',', $values));
+            $enumValues = array_map(function ($value) {
+                return Str::upper(Str::snake($value));
+            }, $enumValues);
+
+            // Enum sınıfını oluştur
+            $this->createEnumClass($enumClassName, $enumValues);
+
+            return "enum('{$column->Field}', \\App\\Enums\\{$enumClassName}::class)";
         }
-        
+
+        // IP Address type
+        if ($column->Field === 'ip_address' || $column->Field === 'ip') {
+            return 'ipAddress';
+        }
+
+        // MAC Address type
+        if ($column->Field === 'mac_address') {
+            return 'macAddress';
+        }
+
+        // UUID type
+        if (str_contains($type, 'char(36)') && (
+            str_contains($column->Field, 'uuid') ||
+            str_contains($column->Field, 'guid')
+        )) {
+            return 'uuid';
+        }
+
+        // Default to string if no match
         return 'string';
+    }
+
+    protected function createEnumClass(string $className, array $values): void
+    {
+        $enumPath = app_path('Enums');
+        if (!File::exists($enumPath)) {
+            File::makeDirectory($enumPath, 0755, true);
+        }
+
+        $cases = implode("\n    ", array_map(function ($value) {
+            return "case {$value};";
+        }, $values));
+
+        $content = <<<PHP
+<?php
+
+namespace App\Enums;
+
+enum {$className}: string
+{
+    {$cases}
+}
+PHP;
+
+        File::put("{$enumPath}/{$className}.php", $content);
+        $this->line("  - Created enum class: App\\Enums\\{$className}");
     }
 
     protected function groupIndexes($indexes)
@@ -330,11 +436,11 @@ class CreateMigrationsFromDatabaseCommand extends Command
         }
 
         $columns = "'" . implode("', '", $indexData['columns']) . "'";
-        
+
         if ($indexData['unique']) {
             return "\$table->unique([{$columns}], '{$indexName}');";
         }
-        
+
         return "\$table->index([{$columns}], '{$indexName}');";
     }
 
@@ -381,7 +487,7 @@ PHP;
         static $indexColumns = [];
         $tableName = $tableName ?? $this->currentTable;
         $cacheKey = "{$tableName}.{$columnName}";
-        
+
         if (!isset($indexColumns[$cacheKey])) {
             $indexColumns[$cacheKey] = false;
             if (!empty($this->currentIndexes)) {
@@ -393,7 +499,7 @@ PHP;
                 }
             }
         }
-        
+
         return $indexColumns[$cacheKey];
     }
 }

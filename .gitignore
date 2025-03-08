@@ -2,4 +2,6 @@
 composer.lock
 .phpunit.result.cache
 .idea
-.vscode 
+.vscode
+/commands.json
+/commandsForUpdate

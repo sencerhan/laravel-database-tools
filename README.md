@@ -1,6 +1,29 @@
 # Laravel DB Tools
 
-Useful tools for creating migration and seeder files from Laravel database tables.
+Generate Laravel migration and seeder files from existing database tables.
+
+## Features
+
+### Migration Generator
+- Supports all MySQL column types including spatial types
+- Auto-detects relationships and creates foreign keys
+- Handles unique and normal indexes
+- Native PHP 8.1+ enum support with class generation
+- Preserves column comments and default values
+- Special handling for UUID, IP, and MAC address fields
+
+### Seeder Generator
+- Creates individual seeder files for each table
+- Updates DatabaseSeeder automatically
+- Preserves data types and handles NULL values
+- Special handling for timestamps and binary data
+- Properly escapes special characters
+
+### Migration Checker
+- Registers existing tables in migrations table
+- Prevents duplicate table creation attempts
+- Maintains proper migration batch ordering
+- Perfect for legacy database integration
 
 ## Installation
 

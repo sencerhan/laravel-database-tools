@@ -6,6 +6,24 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 
+/**
+ * Check and mark migrations as completed for existing tables
+ * 
+ * Features:
+ * - Scans migration files in migrations directory
+ * - Checks if corresponding tables exist in database
+ * - Adds entries to migrations table for existing tables
+ * - Skips already registered migrations
+ * - Maintains proper batch numbering
+ * 
+ * This is useful when:
+ * - You've generated migrations from an existing database
+ * - You want to prevent Laravel from trying to create tables that already exist
+ * - You need to sync your migrations table with actual database state
+ * 
+ * Usage:
+ * php artisan migrations:check-and-save
+ */
 class CheckAndSaveMigrationsCommand extends Command
 {
     protected $signature = 'migrations:check-and-save';

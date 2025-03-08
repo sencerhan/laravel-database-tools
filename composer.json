@@ -36,5 +36,5 @@
     },
     "minimum-stability": "dev",
     "prefer-stable": true,
-    "version": "1.0.6"
+    "version": "1.0.8"
 }
