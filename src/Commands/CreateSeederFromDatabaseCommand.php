@@ -7,6 +7,22 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
 
+/**
+ * Generate seeder files from existing database table data
+ * 
+ * Features:
+ * - Creates individual seeder files for each table
+ * - Updates DatabaseSeeder with new seeder classes
+ * - Handles NULL values and defaults
+ * - Preserves data types (numbers, strings, booleans)
+ * - Special handling for timestamps
+ * - Escapes special characters in string values
+ * 
+ * Usage:
+ * php artisan seeders:from-database                      # All tables
+ * php artisan seeders:from-database --tables=users,posts # Specific tables
+ * php artisan seeders:from-database --without_tables=logs # Exclude tables
+ */
 class CreateSeederFromDatabaseCommand extends Command
 {
     protected $signature = 'seeders:from-database 
