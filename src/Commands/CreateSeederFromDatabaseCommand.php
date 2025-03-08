@@ -88,6 +88,14 @@ class CreateSeederFromDatabaseCommand extends Command
 
     private function createSeederForTable(string $table): ?string
     {
+        // Çok büyük tablolar için chunk kullanımı
+        $count = DB::table($table)->count();
+        
+        if ($count > 1000) {
+            $this->warn("  - Table {$table} has {$count} records. Using chunking to avoid memory issues.");
+            return $this->createChunkedSeederForTable($table, $count);
+        }
+
         $data = DB::table($table)->get();
         if ($data->isEmpty()) {
             return null;
@@ -101,6 +109,40 @@ class CreateSeederFromDatabaseCommand extends Command
         $path = database_path("seeders/{$className}.php");
         File::put($path, $content);
 
+        return $className;
+    }
+
+    private function createChunkedSeederForTable(string $table, int $count): string
+    {
+        $className = Str::studly(Str::singular($table)) . 'Seeder';
+        $chunkSize = 200;
+        
+        $seederContent = "<?php\n\nnamespace Database\\Seeders;\n\n";
+        $seederContent .= "use Illuminate\\Database\\Seeder;\n";
+        $seederContent .= "use Illuminate\\Support\\Facades\\DB;\n\n";
+        $seederContent .= "class {$className} extends Seeder\n{\n";
+        $seederContent .= "    public function run(): void\n    {\n";
+        
+        $seederContent .= "        // Table has {$count} records, processing in chunks of {$chunkSize}\n";
+        $seederContent .= "        // Consider using a raw SQL or CSV import for better performance\n";
+        $seederContent .= "        \$this->command->info('Seeding {$table} table...');\n";
+        $seederContent .= "        \$this->command->getOutput()->progressStart({$count});\n\n";
+        
+        $seederContent .= "        DB::table('{$table}')->orderBy('id')->chunk({$chunkSize}, function (\$records) {\n";
+        $seederContent .= "            foreach (\$records as \$record) {\n";
+        $seederContent .= "                \$data = (array) \$record;\n";
+        $seederContent .= "                unset(\$data['id']); // Remove ID to avoid conflicts\n";
+        $seederContent .= "                DB::table('{$table}')->insert(\$data);\n";
+        $seederContent .= "                \$this->command->getOutput()->progressAdvance();\n";
+        $seederContent .= "            }\n";
+        $seederContent .= "        });\n\n";
+        
+        $seederContent .= "        \$this->command->getOutput()->progressFinish();\n";
+        $seederContent .= "    }\n}\n";
+        
+        $path = database_path("seeders/{$className}.php");
+        File::put($path, $seederContent);
+        
         return $className;
     }
 

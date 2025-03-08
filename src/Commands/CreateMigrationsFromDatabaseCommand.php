@@ -4,6 +4,7 @@ namespace Sencerhan\LaravelDbTools\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
 
 /**
@@ -73,6 +74,22 @@ class CreateMigrationsFromDatabaseCommand extends Command
         $this->info("\nStarting migration creation process...");
 
         try {
+            // Veritabanı sürümünü ve motorunu kontrol et
+            $connection = config('database.default');
+            $driver = config("database.connections.{$connection}.driver");
+            
+            if ($driver !== 'mysql') {
+                $this->warn("Warning: This tool is optimized for MySQL. Using with {$driver} may cause issues.");
+            }
+            
+            // Veritabanı sürüm kontrolü
+            try {
+                $version = DB::select('SELECT version() as version')[0]->version;
+                $this->line("  - Database version: {$version}");
+            } catch (\Exception $e) {
+                $this->warn("  - Could not determine database version");
+            }
+            
             // Belirtilen tablolar veya tüm tabloları al
             $tables = $this->getTables();
 
@@ -141,6 +158,26 @@ class CreateMigrationsFromDatabaseCommand extends Command
                 $this->line("  - Getting index information...");
                 $indexes = DB::select("SHOW INDEXES FROM `{$table}`");
                 $this->info("  ✓ Index information retrieved");
+                
+                // Foreign key kısıtlamalarını da al
+                $this->line("  - Getting foreign key constraints...");
+                try {
+                    $foreignKeys = DB::select("
+                        SELECT 
+                            CONSTRAINT_NAME, 
+                            COLUMN_NAME, 
+                            REFERENCED_TABLE_NAME, 
+                            REFERENCED_COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                        WHERE TABLE_SCHEMA = ? 
+                            AND TABLE_NAME = ?
+                            AND REFERENCED_TABLE_NAME IS NOT NULL
+                    ", [config('database.connections.mysql.database'), $table]);
+                    $this->info("  ✓ Foreign key constraints retrieved");
+                } catch (\Exception $e) {
+                    $this->warn("  ! Failed to retrieve foreign key constraints: " . $e->getMessage());
+                    $foreignKeys = [];
+                }
 
                 $this->line("  - Creating migration file...");
                 $migrationContent = $this->generateMigrationContent($table, $columns, $indexes);
@@ -235,7 +272,9 @@ class CreateMigrationsFromDatabaseCommand extends Command
         }
 
         if ($column->Comment) {
-            $modifiers[] = "->comment('{$column->Comment}')";
+            // Özel karakterleri ve MySQL söz dizimini temizleyelim
+            $comment = str_replace(["'", "\r", "\n"], ["\'", "", "\\n"], $column->Comment);
+            $modifiers[] = "->comment('{$comment}')";
         }
 
         // Unique index kontrolü - sadece index tablosunda olmayan unique'ler için
@@ -256,6 +295,27 @@ class CreateMigrationsFromDatabaseCommand extends Command
             preg_match('/varchar\((\d+)\)/', strtolower($column->Type), $matches);
             $length = $matches[1] ?? 255;
             return "\$table->string('{$column->Field}', {$length}){$modifiersStr};";
+        }
+
+        // Enum için özel işlem
+        if (str_contains($type, 'enum')) {
+            preg_match('/enum\((.*?)\)/', $type, $matches);
+            $values = str_replace("'", '', $matches[1]);
+
+            // Laravel 8+ native enum desteği için sınıf adı oluştur
+            $enumClassName = Str::studly(Str::singular($this->currentTable)) . Str::studly($column->Field) . 'Type';
+
+            // Enum değerlerini PHP enum formatına dönüştür
+            $enumValues = array_map('trim', explode(',', $values));
+            $enumValues = array_map(function ($value) {
+                return Str::upper(Str::snake($value));
+            }, $enumValues);
+
+            // Enum sınıfını oluştur
+            $this->createEnumClass($enumClassName, $enumValues);
+
+            // array_column kullanarak value değerlerini al
+            return "\$table->enum('{$column->Field}', array_column(\\App\\Enums\\{$enumClassName}::cases(), 'value')){$modifiersStr};";
         }
 
         return "\$table->{$type}('{$column->Field}'){$modifiersStr};";
@@ -353,7 +413,8 @@ class CreateMigrationsFromDatabaseCommand extends Command
             // Enum sınıfını oluştur
             $this->createEnumClass($enumClassName, $enumValues);
 
-            return "enum('{$column->Field}', \\App\\Enums\\{$enumClassName}::class)";
+            // array_column kullanarak value değerlerini al
+            return "enum('{$column->Field}', array_column(\\App\\Enums\\{$enumClassName}::cases(), 'value'))";
         }
 
         // IP Address type
@@ -385,9 +446,49 @@ class CreateMigrationsFromDatabaseCommand extends Command
             File::makeDirectory($enumPath, 0755, true);
         }
 
-        $cases = implode("\n    ", array_map(function ($value) {
-            return "case {$value};";
-        }, $values));
+        // Temiz enum cases oluştur
+        $casesStr = '';
+        
+        foreach ($values as $index => $value) {
+            // Özel karakter kontrolü
+            if (!preg_match('/^[a-zA-Z0-9_\-\s]+$/', $value)) {
+                $this->warn("  - Warning: Enum value '{$value}' contains special characters");
+            }
+            
+            // Boş değer kontrolü
+            if (trim($value) === '') {
+                $this->warn("  - Warning: Empty enum value found in {$className}");
+                $value = 'EMPTY_VALUE_' . ($index + 1);
+            }
+            
+            // Geçerli PHP değişken adı oluştur
+            $caseName = preg_replace('/[^a-zA-Z0-9_]/', '_', $value);
+            $caseName = preg_replace('/_+/', '_', $caseName);
+            $caseName = trim($caseName, '_');
+            
+            // Sayı ile başlıyorsa önüne E_ ekle
+            if (is_numeric(substr($caseName, 0, 1))) {
+                $caseName = 'E_' . $caseName;
+            }
+            
+            // Enum değerleri büyük harfle yazılmalı
+            $caseName = strtoupper($caseName);
+            
+            // Boş ise default bir isim ver
+            if (empty($caseName)) {
+                $caseName = 'VALUE_' . ($index + 1);
+            }
+            
+            // Sınıfla ilgili ifadeler varsa temizle
+            if (strpos($value, '::CLASS') !== false || strpos($value, '\\') !== false) {
+                $value = $caseName;
+            }
+            
+            $casesStr .= "    case {$caseName} = '{$value}';\n";
+        }
+        
+        // Son satırdan sonraki yeni satırı kaldır
+        $casesStr = rtrim($casesStr);
 
         $content = <<<PHP
 <?php
@@ -396,7 +497,7 @@ namespace App\Enums;
 
 enum {$className}: string
 {
-    {$cases}
+{$casesStr}
 }
 PHP;
 
