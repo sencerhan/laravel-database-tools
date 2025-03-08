@@ -2,6 +2,13 @@
     "name": "sencerhan/laravel-db-tools",
     "description": "Generate Laravel migration and seeder files from existing database tables. Easily create migrations and seeders with a single command.",
     "type": "library",
+    "keywords": [
+        "laravel",
+        "database",
+        "migration",
+        "seeder",
+        "generator"
+    ],
     "license": "MIT",
     "authors": [
         {
@@ -27,6 +34,7 @@
             ]
         }
     },
-    "minimum-stability": "stable",
-    "prefer-stable": true
-} 
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "version": "1.0.6"
+}

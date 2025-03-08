@@ -9,43 +9,47 @@ use Illuminate\Support\Str;
 
 class CreateSeederFromDatabaseCommand extends Command
 {
-    protected $signature = 'seeders:from-database {--table=* : Belirli tabloları seç}';
-    protected $description = 'Veritabanındaki tablolardan seeder dosyaları oluştur';
+    protected $signature = 'seeders:from-database 
+        {--tables= : Specify tables separated by commas}
+        {--without_tables= : Exclude tables separated by commas}';
+    protected $description = 'Create seeder files from existing database tables';
 
     public function handle(): int
     {
-        $this->info('Seeder oluşturma işlemi başlatıldı...');
+        $this->info('Starting seeder creation process...');
         
-        // Tablo listesini al
-        $specifiedTables = $this->option('table');
+        $specifiedTables = $this->option('tables')
+            ? explode(',', $this->option('tables'))
+            : [];
+            
         $tables = empty($specifiedTables) 
             ? $this->getAllTables() 
             : $specifiedTables;
 
-        $this->info('Toplam ' . count($tables) . ' tablo bulundu.');
+        $this->info('Total ' . count($tables) . ' tables found.');
 
         $createdSeeders = [];
         foreach ($tables as $table) {
-            $this->info("'{$table}' tablosu işleniyor...");
+            $this->info("Processing '{$table}' table...");
             
             $seederClass = $this->createSeederForTable($table);
             if ($seederClass) {
                 $createdSeeders[] = $seederClass;
-                $this->info("[✓] {$seederClass} başarıyla oluşturuldu.");
+                $this->info("[✓] {$seederClass} successfully created.");
             } else {
-                $this->warn("[!] {$table} tablosu boş olduğu için seeder oluşturulmadı.");
+                $this->warn("[!] No seeder created for {$table} table as it is empty.");
             }
         }
 
         if (!empty($createdSeeders)) {
-            $this->info('DatabaseSeeder güncelleniyor...');
+            $this->info('Updating DatabaseSeeder...');
             $this->updateDatabaseSeeder($createdSeeders);
-            $this->info("[✓] DatabaseSeeder güncellendi. Toplam " . count($createdSeeders) . " seeder oluşturuldu.");
+            $this->info("[✓] DatabaseSeeder updated. Total " . count($createdSeeders) . " seeders created.");
         } else {
-            $this->warn("[!] Hiç seeder oluşturulmadı. Tablolar boş olabilir.");
+            $this->warn("[!] No seeders created. Tables might be empty.");
         }
 
-        $this->info('İşlem tamamlandı.');
+        $this->info('Process completed.');
         return Command::SUCCESS;
     }
 
@@ -55,10 +59,14 @@ class CreateSeederFromDatabaseCommand extends Command
         $dbName = DB::getDatabaseName();
         $columnName = 'Tables_in_' . $dbName;
         
+        $excludedTables = $this->option('without_tables') 
+            ? explode(',', $this->option('without_tables')) 
+            : [];
+        
         return array_filter(array_map(function($table) use ($columnName) {
             return $table->$columnName;
-        }, $tables), function($table) {
-            return $table !== 'migrations';
+        }, $tables), function($table) use ($excludedTables) {
+            return $table !== 'migrations' && !in_array($table, $excludedTables);
         });
     }
 
@@ -69,7 +77,7 @@ class CreateSeederFromDatabaseCommand extends Command
             return null;
         }
 
-        $this->line("- {$table} tablosundan " . $data->count() . " kayıt okunuyor...");
+        $this->line("- Reading " . $data->count() . " records from {$table} table...");
         
         $className = Str::studly(Str::singular($table)) . 'Seeder';
         $content = $this->generateSeederContent($className, $table, $data);
@@ -222,4 +230,4 @@ PHP;
 
         return $formatted;
     }
-} 
+}

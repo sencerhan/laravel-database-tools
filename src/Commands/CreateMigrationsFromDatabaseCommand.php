@@ -13,23 +13,25 @@ class CreateMigrationsFromDatabaseCommand extends Command
      *
      * @var string
      */
-    protected $signature = 'migrations:from-database {--table=* : Belirli tabloları seç}';
+    protected $signature = 'migrations:from-database 
+        {--tables= : Specify tables separated by commas}
+        {--without_tables= : Exclude tables separated by commas}';
 
     /**
      * The console command description.
      *
      * @var string
      */
-    protected $description = 'Veritabanındaki tablolardan migration dosyaları oluştur';
+    protected $description = 'Create migration files from existing database tables';
 
     /**
-     * Geçici olarak index bilgilerini saklar
+     * Temporarily stores index information
      * @var array|null
      */
     protected $currentIndexes = null;
 
     /**
-     * Geçici olarak tablo adını saklar
+     * Temporarily stores table name
      * @var string|null
      */
     protected $currentTable = null;
@@ -51,24 +53,24 @@ class CreateMigrationsFromDatabaseCommand extends Command
      */
     public function handle()
     {
-        $this->info("\nMigration oluşturma işlemi başlatılıyor...");
+        $this->info("\nStarting migration creation process...");
 
         try {
             // Belirtilen tablolar veya tüm tabloları al
             $tables = $this->getTables();
 
             if (empty($tables)) {
-                $this->warn('İşlenecek tablo bulunamadı!');
+                $this->warn('No tables found to process!');
                 return Command::SUCCESS;
             }
 
             $this->processTables($tables);
 
-            $this->info("\nMigration oluşturma işlemi tamamlandı!");
+            $this->info("\nMigration creation process completed!");
             return Command::SUCCESS;
 
         } catch (\Exception $e) {
-            $this->error("\nBir hata oluştu: " . $e->getMessage());
+            $this->error("\nAn error occurred: " . $e->getMessage());
             $this->error($e->getTraceAsString());
             return Command::FAILURE;
         }
@@ -76,10 +78,17 @@ class CreateMigrationsFromDatabaseCommand extends Command
 
     protected function getTables(): array 
     {
-        $specifiedTables = $this->option('table');
+        $specifiedTables = $this->option('tables') 
+            ? explode(',', $this->option('tables'))
+            : [];
+        $excludedTables = $this->option('without_tables') 
+            ? explode(',', $this->option('without_tables')) 
+            : [];
         
         if (!empty($specifiedTables)) {
-            return array_filter($specifiedTables, fn($table) => $table !== 'migrations');
+            return array_filter($specifiedTables, fn($table) => 
+                $table !== 'migrations' && !in_array($table, $excludedTables)
+            );
         }
 
         // Tabloları oluşturulma tarihine göre sıralı olarak al
@@ -92,7 +101,7 @@ class CreateMigrationsFromDatabaseCommand extends Command
 
         return array_filter(
             array_map(fn($table) => $table->TABLE_NAME, $tables),
-            fn($table) => $table !== 'migrations'
+            fn($table) => $table !== 'migrations' && !in_array($table, $excludedTables)
         );
     }
 
@@ -102,27 +111,27 @@ class CreateMigrationsFromDatabaseCommand extends Command
         $current = 1;
 
         foreach ($tables as $table) {
-            $this->info("\n[$current/$totalTables] '{$table}' tablosu için migration oluşturuluyor...");
+            $this->info("\n[$current/$totalTables] Creating migration for '{$table}' table...");
             
             try {
                 // Sütun bilgilerini al
-                $this->line("  - Sütun bilgileri alınıyor...");
+                $this->line("  - Getting column information...");
                 $columns = DB::select("SHOW FULL COLUMNS FROM `{$table}`");
-                $this->info("  ✓ Sütun bilgileri alındı");
+                $this->info("  ✓ Column information retrieved");
                 
                 // İndeks bilgilerini al
-                $this->line("  - İndeks bilgileri alınıyor...");
+                $this->line("  - Getting index information...");
                 $indexes = DB::select("SHOW INDEXES FROM `{$table}`");
-                $this->info("  ✓ İndeks bilgileri alındı");
+                $this->info("  ✓ Index information retrieved");
 
-                $this->line("  - Migration dosyası oluşturuluyor...");
+                $this->line("  - Creating migration file...");
                 $migrationContent = $this->generateMigrationContent($table, $columns, $indexes);
                 $fileName = $this->createMigrationFile($table, $migrationContent);
-                $this->info("  ✓ Migration dosyası oluşturuldu");
+                $this->info("  ✓ Migration file created");
                 
-                $this->info("  Başarılı! Migration dosyası oluşturuldu: {$fileName}");
+                $this->info("  Success! Migration file created: {$fileName}");
             } catch (\Exception $e) {
-                $this->error("\n  HATA! {$table} tablosu için migration oluşturulurken hata: " . $e->getMessage());
+                $this->error("\n  ERROR! Failed to create migration for {$table} table: " . $e->getMessage());
             }
 
             $current++;
@@ -218,6 +227,12 @@ class CreateMigrationsFromDatabaseCommand extends Command
 
         $modifiersStr = implode('', $modifiers);
         
+        // Decimal için özel işlem ekleyelim
+        if (str_contains($type, 'decimal,')) {
+            $parts = explode(',', $type);
+            return "\$table->decimal('{$column->Field}', " . trim($parts[1]) . ", " . trim($parts[2]) . "){$modifiersStr};";
+        }
+        
         // VARCHAR için özel işlem
         if ($type === 'string') {
             preg_match('/varchar\((\d+)\)/', strtolower($column->Type), $matches);
@@ -267,7 +282,7 @@ class CreateMigrationsFromDatabaseCommand extends Command
         if (str_contains($type, 'decimal')) {
             preg_match('/decimal\((\d+),(\d+)\)/', $type, $matches);
             if (isset($matches[1], $matches[2])) {
-                return "decimal('{$matches[1]}', '{$matches[2]}')";
+                return "decimal, {$matches[1]}, {$matches[2]}";  // String yerine parametre olarak gönderilecek
             }
             return 'decimal';
         }
@@ -381,4 +396,4 @@ PHP;
         
         return $indexColumns[$cacheKey];
     }
-} 
+}
