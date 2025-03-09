@@ -305,8 +305,13 @@ class FetchDatabaseSchemaCommand extends Command
             $existingColumnsMap[$column->Field] = $column;
         }
         
+        // Get current indexes
+        $existingIndexes = $this->getTableIndexes($table);
+        $existingIndexesMap = $this->groupIndexes($existingIndexes);
+        
         // Generate SQL to modify table
         $alterStatements = [];
+        $changesDetected = false;
         
         // Process columns from migration
         foreach ($migrationSchema['columns'] as $column) {
@@ -319,28 +324,52 @@ class FetchDatabaseSchemaCommand extends Command
                 $existingColumn = $existingColumnsMap[$column['name']];
                 
                 if ($this->columnNeedsUpdate($column, $existingColumn)) {
+                    $changesDetected = true;
                     $alterStatements[] = $this->generateAlterColumnSQL($table, $column, $existingColumn);
                 }
             } else {
                 // Column doesn't exist, add it
+                $changesDetected = true;
                 $alterStatements[] = $this->generateAddColumnSQL($table, $column);
             }
         }
         
-        // Execute ALTER statements
-        if (!empty($alterStatements)) {
-            $this->info("  Executing " . count($alterStatements) . " ALTER statements...");
+        // Process indexes from migration
+        foreach ($migrationSchema['indexes'] as $index) {
+            $indexName = $index['name'];
             
-            foreach ($alterStatements as $sql) {
-                try {
-                    $this->line("    - " . $sql);
-                    DB::statement($sql);
-                } catch (\Exception $e) {
-                    $this->error("    ! Error executing SQL: " . $e->getMessage());
+            if (!isset($existingIndexesMap[$indexName])) {
+                // Index doesn't exist, add it
+                $changesDetected = true;
+                $alterStatements[] = $this->generateAddIndexSQL($table, $index);
+            } else {
+                // Index exists, check if it needs to be updated
+                $existingIndex = $existingIndexesMap[$indexName];
+                
+                if ($this->indexNeedsUpdate($index, $existingIndex)) {
+                    $changesDetected = true;
+                    $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
+                    $alterStatements[] = $this->generateAddIndexSQL($table, $index);
                 }
             }
-            
-            $this->info("  Table {$table} updated successfully.");
+        }
+        
+        // Execute ALTER statements only if changes are detected
+        if ($changesDetected) {
+            if (!empty($alterStatements)) {
+                $this->info("  Executing " . count($alterStatements) . " ALTER statements...");
+                
+                foreach ($alterStatements as $sql) {
+                    try {
+                        $this->line("    - " . $sql);
+                        DB::statement($sql);
+                    } catch (\Exception $e) {
+                        $this->error("    ! Error executing SQL: " . $e->getMessage());
+                    }
+                }
+                
+                $this->info("  Table {$table} updated successfully.");
+            }
         } else {
             $this->info("  Table {$table} already matches migration. No changes needed.");
         }
@@ -360,7 +389,7 @@ class FetchDatabaseSchemaCommand extends Command
     }
 
     /**
-     * Check if a column needs to be updated
+     * Check if a column needs to be updated - improved with detailed logging
      *
      * @param array $migrationColumn
      * @param object $existingColumn
@@ -373,6 +402,7 @@ class FetchDatabaseSchemaCommand extends Command
         $currentColumnType = strtolower($existingColumn->Type);
         
         if (!$this->columnTypesMatch($migrationColumnType, $currentColumnType)) {
+            $this->line("    * Column {$existingColumn->Field}: Type mismatch - Migration: {$migrationColumnType}, Current: {$currentColumnType}");
             return true;
         }
         
@@ -381,6 +411,9 @@ class FetchDatabaseSchemaCommand extends Command
         $currentNullable = $existingColumn->Null === 'YES';
         
         if ($migrationNullable !== $currentNullable) {
+            $migrationNullText = $migrationNullable ? 'NULL' : 'NOT NULL';
+            $currentNullText = $currentNullable ? 'NULL' : 'NOT NULL';
+            $this->line("    * Column {$existingColumn->Field}: Nullable mismatch - Migration: {$migrationNullText}, Current: {$currentNullText}");
             return true;
         }
         
@@ -388,11 +421,48 @@ class FetchDatabaseSchemaCommand extends Command
         $migrationDefault = $migrationColumn['modifiers']['default'] ?? null;
         $currentDefault = $existingColumn->Default;
         
-        if ($migrationDefault !== $currentDefault && !($migrationDefault === 'null' && $currentDefault === null)) {
+        // Special handling for defaults to avoid unnecessary updates
+        if ($this->defaultsAreDifferent($migrationDefault, $currentDefault)) {
+            $migrationDefaultText = is_null($migrationDefault) ? 'NULL' : $migrationDefault;
+            $currentDefaultText = is_null($currentDefault) ? 'NULL' : $currentDefault;
+            $this->line("    * Column {$existingColumn->Field}: Default mismatch - Migration: {$migrationDefaultText}, Current: {$currentDefaultText}");
             return true;
         }
         
         return false;
+    }
+    
+    /**
+     * Compare default values with special handling
+     * 
+     * @param mixed $default1
+     * @param mixed $default2
+     * @return bool
+     */
+    protected function defaultsAreDifferent($default1, $default2): bool
+    {
+        // If both are null or empty, they're the same
+        if (($default1 === null || $default1 === '') && ($default2 === null || $default2 === '')) {
+            return false;
+        }
+        
+        // If one is null but other isn't
+        if (($default1 === null && $default2 !== null) || ($default1 !== null && $default2 === null)) {
+            return true;
+        }
+        
+        // Handle quoted values
+        $default1 = trim($default1, "'\"");
+        $default2 = trim($default2, "'\"");
+        
+        // CURRENT_TIMESTAMP special case
+        if (($default1 === 'CURRENT_TIMESTAMP' || $default1 === 'now()') && 
+            ($default2 === 'CURRENT_TIMESTAMP' || $default2 === 'now()')) {
+            return false;
+        }
+        
+        // Compare as strings
+        return (string)$default1 !== (string)$default2;
     }
 
     /**
@@ -635,5 +705,97 @@ class FetchDatabaseSchemaCommand extends Command
     protected function getTableIndexes(string $table): array
     {
         return DB::select("SHOW INDEXES FROM `{$table}`");
+    }
+
+    /**
+     * Check if an index needs to be updated
+     *
+     * @param array $migrationIndex
+     * @param array $existingIndex
+     * @return bool
+     */
+    protected function indexNeedsUpdate(array $migrationIndex, array $existingIndex): bool
+    {
+        // Check if index type is different (unique vs. normal)
+        if ($migrationIndex['type'] === 'unique' && !$existingIndex['unique']) {
+            $this->line("    * Index {$migrationIndex['name']}: Type mismatch - Migration: UNIQUE, Current: INDEX");
+            return true;
+        }
+        
+        if ($migrationIndex['type'] !== 'unique' && $existingIndex['unique']) {
+            $this->line("    * Index {$migrationIndex['name']}: Type mismatch - Migration: INDEX, Current: UNIQUE");
+            return true;
+        }
+        
+        // Check if index columns are different
+        $migrationColumns = $migrationIndex['columns'];
+        $existingColumns = $existingIndex['columns'];
+        
+        sort($migrationColumns);
+        sort($existingColumns);
+        
+        if ($migrationColumns !== $existingColumns) {
+            $migrationColumnsList = implode(', ', $migrationColumns);
+            $existingColumnsList = implode(', ', $existingColumns);
+            $this->line("    * Index {$migrationIndex['name']}: Columns mismatch - Migration: [{$migrationColumnsList}], Current: [{$existingColumnsList}]");
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Generate SQL to add a new index
+     *
+     * @param string $table
+     * @param array $index
+     * @return string
+     */
+    protected function generateAddIndexSQL(string $table, array $index): string
+    {
+        $columns = '`' . implode('`, `', $index['columns']) . '`';
+        $indexType = $index['type'] === 'unique' ? 'UNIQUE' : '';
+        $indexName = $index['name'];
+        
+        return "ALTER TABLE `{$table}` ADD {$indexType} INDEX `{$indexName}` ({$columns})";
+    }
+
+    /**
+     * Generate SQL to drop an index
+     *
+     * @param string $table
+     * @param string $indexName
+     * @return string
+     */
+    protected function generateDropIndexSQL(string $table, string $indexName): string
+    {
+        return "ALTER TABLE `{$table}` DROP INDEX `{$indexName}`";
+    }
+
+    /**
+     * Group indexes by name
+     *
+     * @param array $indexes
+     * @return array
+     */
+    protected function groupIndexes(array $indexes): array
+    {
+        $grouped = [];
+        foreach ($indexes as $index) {
+            $name = $index->Key_name;
+            if ($name === 'PRIMARY') {
+                continue; // Skip primary key
+            }
+            
+            if (!isset($grouped[$name])) {
+                $grouped[$name] = [
+                    'type' => $index->Index_type,
+                    'columns' => [],
+                    'unique' => ($index->Non_unique == 0)
+                ];
+            }
+            $grouped[$name]['columns'][] = $index->Column_name;
+        }
+        return $grouped;
     }
 }
