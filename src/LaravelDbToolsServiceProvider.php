@@ -6,6 +6,7 @@ use Illuminate\Support\ServiceProvider;
 use Sencerhan\LaravelDbTools\Commands\CreateMigrationsFromDatabaseCommand;
 use Sencerhan\LaravelDbTools\Commands\CreateSeederFromDatabaseCommand;
 use Sencerhan\LaravelDbTools\Commands\CheckAndSaveMigrationsCommand;
+use Sencerhan\LaravelDbTools\Commands\FetchDatabaseSchemaCommand;
 
 class LaravelDbToolsServiceProvider extends ServiceProvider
 {
@@ -16,6 +17,7 @@ class LaravelDbToolsServiceProvider extends ServiceProvider
                 CreateMigrationsFromDatabaseCommand::class,
                 CreateSeederFromDatabaseCommand::class,
                 CheckAndSaveMigrationsCommand::class,
+                FetchDatabaseSchemaCommand::class,
             ]);
         }
     }
