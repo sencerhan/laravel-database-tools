@@ -201,6 +201,18 @@ class FetchDatabaseSchemaCommand extends Command
                 continue;
             }
             
+            // Check for softDeletes method
+            if (strpos($line, '$table->softDeletes') !== false) {
+                $columns[] = [
+                    'type' => 'timestamp',
+                    'name' => 'deleted_at',
+                    'params' => [],
+                    'modifiers' => ['nullable' => true],
+                    'original' => $line
+                ];
+                continue;
+            }
+            
             if (empty($line)) {
                 continue;
             }
@@ -322,6 +334,55 @@ class FetchDatabaseSchemaCommand extends Command
         $alterStatements = [];
         $changesDetected = false;
         
+        // Geçerli migrationda olması gereken tüm sütunların isimlerini topluyoruz
+        $migrationColumnNames = [];
+        foreach ($migrationSchema['columns'] as $column) {
+            if (!empty($column['name'])) {
+                $migrationColumnNames[] = $column['name'];
+            }
+        }
+        
+        // Timestamps için created_at ve updated_at ekleyelim
+        // Ayrıca alternatif timestamp isimlerini de kontrol edelim (created, updated, creation_date vs.)
+        if (!empty($migrationSchema['hasTimestamps'])) {
+            // Standart timestamp sütun adları
+            $timestampColumns = ['created_at', 'updated_at'];
+            
+            // Alternatif isimler için eşleştirmeler
+            $timestampAlternatives = [
+                'created_at' => ['created', 'creation_date', 'date_created', 'create_time', 'created_time', 'insert_time', 'inserted_at'],
+                'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified_at', 'last_modified']
+            ];
+            
+            // Her bir timestamp sütunu için kontrol yapıyoruz
+            foreach ($timestampColumns as $timestampColumn) {
+                // Eğer bu sütun varsa listeye ekle
+                $migrationColumnNames[] = $timestampColumn;
+                
+                // Alternatif isimler varsa ve timestamp olmayan bir tabloysa, bunları da ekleyelim
+                foreach ($timestampAlternatives[$timestampColumn] as $alternative) {
+                    if (isset($existingColumnsMap[$alternative]) && 
+                        (str_contains(strtolower($existingColumnsMap[$alternative]->Type), 'timestamp') || 
+                         str_contains(strtolower($existingColumnsMap[$alternative]->Type), 'datetime'))) {
+                        $migrationColumnNames[] = $alternative;
+                        $this->line("    * Found alternative timestamp column: {$alternative} (will keep it)");
+                    }
+                }
+            }
+        }
+        
+        // Veritabanında var ama migration'da olmayan sütunları tespit et ve sil
+        foreach ($existingColumnsMap as $columnName => $existingColumn) {
+            if (!in_array($columnName, $migrationColumnNames)) {
+                // Ama id sütununu asla silme
+                if ($columnName !== 'id') {
+                    $changesDetected = true;
+                    $alterStatements[] = $this->generateDropColumnSQL($table, $columnName);
+                    $this->line("    * Dropping column {$columnName} (not in migration)");
+                }
+            }
+        }
+        
         // Process columns from migration
         foreach ($migrationSchema['columns'] as $column) {
             if (empty($column['name'])) {
@@ -356,7 +417,8 @@ class FetchDatabaseSchemaCommand extends Command
             }
         }
         
-        // Process indexes from migration
+        // Process indexes from migration and check for missing indexes
+        // Önce migration dosyasında tanımlı indekslerin veritabanında olup olmadığını kontrol edelim
         foreach ($migrationSchema['indexes'] as $index) {
             $indexName = $index['name'];
             
@@ -364,6 +426,7 @@ class FetchDatabaseSchemaCommand extends Command
                 // Index doesn't exist, add it
                 $changesDetected = true;
                 $alterStatements[] = $this->generateAddIndexSQL($table, $index);
+                $this->line("    * Adding missing index {$indexName}");
             } else {
                 // Index exists, check if it needs to be updated
                 $existingIndex = $existingIndexesMap[$indexName];
@@ -372,7 +435,22 @@ class FetchDatabaseSchemaCommand extends Command
                     $changesDetected = true;
                     $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
                     $alterStatements[] = $this->generateAddIndexSQL($table, $index);
+                    $this->line("    * Updating index {$indexName}");
                 }
+            }
+        }
+        
+        // Şimdi de veritabanında olup migration dosyasında olmayan indeksleri kontrol edelim
+        $migrationIndexNames = array_map(function($index) {
+            return $index['name'];
+        }, $migrationSchema['indexes']);
+        
+        foreach ($existingIndexesMap as $indexName => $existingIndex) {
+            if (!in_array($indexName, $migrationIndexNames) && $indexName !== 'PRIMARY') {
+                // Bu indeks migration dosyasında yok, silelim
+                $changesDetected = true;
+                $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
+                $this->line("    * Dropping index {$indexName} (not in migration)");
             }
         }
         
@@ -708,6 +786,18 @@ class FetchDatabaseSchemaCommand extends Command
     }
 
     /**
+     * Generate SQL to drop a column
+     *
+     * @param string $table
+     * @param string $columnName
+     * @return string
+     */
+    protected function generateDropColumnSQL(string $table, string $columnName): string
+    {
+        return "ALTER TABLE `{$table}` DROP COLUMN `{$columnName}`";
+    }
+
+    /**
      * Get columns for table from database
      *
      * @param string $table
@@ -819,5 +909,135 @@ class FetchDatabaseSchemaCommand extends Command
             $grouped[$name]['columns'][] = $index->Column_name;
         }
         return $grouped;
+    }
+
+    /**
+     * Handle special column naming conventions and alternatives
+     * 
+     * @param string $columnName
+     * @return bool|string Returns false if not a special column, or the canonical name if it is
+     */
+    protected function detectSpecialColumn(string $columnName): bool|string
+    {
+        // Timestamp alternatives
+        $timestampAlternatives = [
+            'created_at' => ['created', 'creation_date', 'date_created', 'create_time', 'created_time'],
+            'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified']
+        ];
+        
+        foreach ($timestampAlternatives as $standard => $alternatives) {
+            if (in_array(strtolower($columnName), $alternatives)) {
+                return $standard;
+            }
+        }
+        
+        // Special ID columns (not foreign keys)
+        $idAlternatives = ['uid', 'uuid', 'guid', 'identifier'];
+        if (in_array(strtolower($columnName), $idAlternatives)) {
+            return 'id';
+        }
+        
+        return false;
+    }
+
+    /**
+     * Parse migration schema block with improved recognition for timestamps and other conventions
+     *
+     * @param string $schemaBlock
+     * @return array
+     */
+    protected function parseMigrationSchema(string $schemaBlock): array
+    {
+        $lines = explode("\n", $schemaBlock);
+        $columns = [];
+        $indexes = [];
+        $hasTimestamps = false;
+        
+        foreach ($lines as $line) {
+            $line = trim($line);
+            
+            // Check for timestamps method (both standard and commented variations)
+            if ($line === '$table->timestamps();' || 
+                preg_match('/\/\/\s*\$table->timestamps\(\);/', $line) || 
+                preg_match('/\/\*\s*\$table->timestamps\(\);\s*\*\//', $line)) {
+                $hasTimestamps = true;
+                continue;
+            }
+            
+            // Check for softDeletes method
+            if (strpos($line, '$table->softDeletes') !== false) {
+                $columns[] = [
+                    'type' => 'timestamp',
+                    'name' => 'deleted_at',
+                    'params' => [],
+                    'modifiers' => ['nullable' => true],
+                    'original' => $line
+                ];
+                continue;
+            }
+            
+            if (empty($line)) {
+                continue;
+            }
+            
+            // Extract column definitions (improved regex to match more patterns)
+            if (preg_match('/\$table->([a-zA-Z0-9_]+)\((?:[\'"](.*?)[\'"])?(?:,?\s*(.*?))?\)((?:->.*?)*);/', $line, $matches)) {
+                $columnType = $matches[1];
+                $columnName = $matches[2] ?? '';
+                $columnParams = isset($matches[3]) && !empty(trim($matches[3])) ? explode(',', $matches[3]) : [];
+                $modifiers = $matches[4] ?? '';
+                
+                // Handle special case for array_column with enum
+                if (strpos($line, 'array_column') !== false) {
+                    preg_match('/\$table->enum\([\'"](.+?)[\'"],\s*array_column\(.*?::cases\(\),\s*[\'"]value[\'"]\)\)((?:->.*?)*);/', $line, $enumMatches);
+                    if (!empty($enumMatches)) {
+                        $columnType = 'enum';
+                        $columnName = $enumMatches[1];
+                        $modifiers = $enumMatches[2] ?? '';
+                    }
+                }
+                
+                $columns[] = [
+                    'type' => $columnType,
+                    'name' => $columnName,
+                    'params' => array_map('trim', $columnParams),
+                    'modifiers' => $this->parseModifiers($modifiers),
+                    'original' => $line
+                ];
+            }
+            
+            // Extract index definitions (improved regex to match more patterns)
+            else if (preg_match('/\$table->([a-zA-Z0-9_]+)\(\[(.*?)\],?\s*(?:[\'"](.+?)[\'"]\s*)?\);/', $line, $matches)) {
+                $indexType = $matches[1]; // unique, index, etc.
+                $indexColumns = array_map('trim', explode("','", str_replace(["'", '"'], '', $matches[2])));
+                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
+                
+                $indexes[] = [
+                    'type' => $indexType,
+                    'columns' => $indexColumns,
+                    'name' => $indexName,
+                    'original' => $line
+                ];
+            }
+        }
+        
+        return [
+            'columns' => $columns,
+            'indexes' => $indexes,
+            'hasTimestamps' => $hasTimestamps
+        ];
+    }
+
+    /**
+     * Generate a standard index name when none is provided
+     * 
+     * @param string $type
+     * @param array $columns
+     * @return string
+     */
+    protected function generateIndexName(string $type, array $columns): string
+    {
+        $prefix = $type === 'unique' ? 'unique' : 'index';
+        return $prefix . '_' . implode('_', $columns);
     }
 }
