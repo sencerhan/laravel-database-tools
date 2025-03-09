@@ -181,6 +181,7 @@ class FetchDatabaseSchemaCommand extends Command
 
     /**
      * Parse migration schema block to extract columns and indexes
+     * with improved recognition for timestamps and other conventions
      *
      * @param string $schemaBlock
      * @return array
@@ -195,8 +196,10 @@ class FetchDatabaseSchemaCommand extends Command
         foreach ($lines as $line) {
             $line = trim($line);
             
-            // Check for timestamps method
-            if ($line === '$table->timestamps();') {
+            // Check for timestamps method (both standard and commented variations)
+            if ($line === '$table->timestamps();' || 
+                preg_match('/\/\/\s*\$table->timestamps\(\);/', $line) || 
+                preg_match('/\/\*\s*\$table->timestamps\(\);\s*\*\//', $line)) {
                 $hasTimestamps = true;
                 continue;
             }
@@ -217,7 +220,7 @@ class FetchDatabaseSchemaCommand extends Command
                 continue;
             }
             
-            // Extract column definitions - Updated regex to match complex column definitions
+            // Extract column definitions (improved regex to match more patterns)
             if (preg_match('/\$table->([a-zA-Z0-9_]+)\((?:[\'"](.*?)[\'"])?(?:,?\s*(.*?))?\)((?:->.*?)*);/', $line, $matches)) {
                 $columnType = $matches[1];
                 $columnName = $matches[2] ?? '';
@@ -243,11 +246,11 @@ class FetchDatabaseSchemaCommand extends Command
                 ];
             }
             
-            // Extract index definitions
-            else if (preg_match('/\$table->([a-zA-Z0-9_]+)\(\[(.*?)\],\s*[\'"](.+?)[\'"]\);/', $line, $matches)) {
+            // Extract index definitions (improved regex to match more patterns)
+            else if (preg_match('/\$table->([a-zA-Z0-9_]+)\(\[(.*?)\],?\s*(?:[\'"](.+?)[\'"]\s*)?\);/', $line, $matches)) {
                 $indexType = $matches[1]; // unique, index, etc.
                 $indexColumns = array_map('trim', explode("','", str_replace(["'", '"'], '', $matches[2])));
-                $indexName = $matches[3];
+                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
                 
                 $indexes[] = [
                     'type' => $indexType,
@@ -938,94 +941,6 @@ class FetchDatabaseSchemaCommand extends Command
         }
         
         return false;
-    }
-
-    /**
-     * Parse migration schema block with improved recognition for timestamps and other conventions
-     *
-     * @param string $schemaBlock
-     * @return array
-     */
-    protected function parseMigrationSchema(string $schemaBlock): array
-    {
-        $lines = explode("\n", $schemaBlock);
-        $columns = [];
-        $indexes = [];
-        $hasTimestamps = false;
-        
-        foreach ($lines as $line) {
-            $line = trim($line);
-            
-            // Check for timestamps method (both standard and commented variations)
-            if ($line === '$table->timestamps();' || 
-                preg_match('/\/\/\s*\$table->timestamps\(\);/', $line) || 
-                preg_match('/\/\*\s*\$table->timestamps\(\);\s*\*\//', $line)) {
-                $hasTimestamps = true;
-                continue;
-            }
-            
-            // Check for softDeletes method
-            if (strpos($line, '$table->softDeletes') !== false) {
-                $columns[] = [
-                    'type' => 'timestamp',
-                    'name' => 'deleted_at',
-                    'params' => [],
-                    'modifiers' => ['nullable' => true],
-                    'original' => $line
-                ];
-                continue;
-            }
-            
-            if (empty($line)) {
-                continue;
-            }
-            
-            // Extract column definitions (improved regex to match more patterns)
-            if (preg_match('/\$table->([a-zA-Z0-9_]+)\((?:[\'"](.*?)[\'"])?(?:,?\s*(.*?))?\)((?:->.*?)*);/', $line, $matches)) {
-                $columnType = $matches[1];
-                $columnName = $matches[2] ?? '';
-                $columnParams = isset($matches[3]) && !empty(trim($matches[3])) ? explode(',', $matches[3]) : [];
-                $modifiers = $matches[4] ?? '';
-                
-                // Handle special case for array_column with enum
-                if (strpos($line, 'array_column') !== false) {
-                    preg_match('/\$table->enum\([\'"](.+?)[\'"],\s*array_column\(.*?::cases\(\),\s*[\'"]value[\'"]\)\)((?:->.*?)*);/', $line, $enumMatches);
-                    if (!empty($enumMatches)) {
-                        $columnType = 'enum';
-                        $columnName = $enumMatches[1];
-                        $modifiers = $enumMatches[2] ?? '';
-                    }
-                }
-                
-                $columns[] = [
-                    'type' => $columnType,
-                    'name' => $columnName,
-                    'params' => array_map('trim', $columnParams),
-                    'modifiers' => $this->parseModifiers($modifiers),
-                    'original' => $line
-                ];
-            }
-            
-            // Extract index definitions (improved regex to match more patterns)
-            else if (preg_match('/\$table->([a-zA-Z0-9_]+)\(\[(.*?)\],?\s*(?:[\'"](.+?)[\'"]\s*)?\);/', $line, $matches)) {
-                $indexType = $matches[1]; // unique, index, etc.
-                $indexColumns = array_map('trim', explode("','", str_replace(["'", '"'], '', $matches[2])));
-                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
-                
-                $indexes[] = [
-                    'type' => $indexType,
-                    'columns' => $indexColumns,
-                    'name' => $indexName,
-                    'original' => $line
-                ];
-            }
-        }
-        
-        return [
-            'columns' => $columns,
-            'indexes' => $indexes,
-            'hasTimestamps' => $hasTimestamps
-        ];
     }
 
     /**
