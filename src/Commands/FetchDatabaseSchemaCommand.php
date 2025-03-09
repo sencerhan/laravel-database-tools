@@ -331,6 +331,11 @@ class FetchDatabaseSchemaCommand extends Command
         if (strpos($modifiersStr, '->unique()') !== false) {
             $modifiers['unique'] = true;
         }
+
+        // Yeni: index() modifier'ını yakala
+        if (strpos($modifiersStr, '->index()') !== false) {
+            $modifiers['index'] = true;
+        }
         
         return $modifiers;
     }
@@ -400,7 +405,50 @@ class FetchDatabaseSchemaCommand extends Command
             }
         }
         
-        // Veritabanında var ama migration'da olmayan sütunları tespit et ve sil
+        // Migration'daki tüm indeks isimlerini topla
+        $migrationIndexNames = array_map(function($index) {
+            return $index['name'];
+        }, $migrationSchema['indexes']);
+
+        // Ek olarak column modifier'lardan gelen index isimlerini de ekle
+        foreach ($migrationSchema['columns'] as $column) {
+            if (!empty($column['name'])) {
+                if (isset($column['modifiers']['unique'])) {
+                    $migrationIndexNames[] = $this->generateIndexName('unique', [$column['name']]);
+                }
+                if (isset($column['modifiers']['index'])) {
+                    $migrationIndexNames[] = $this->generateIndexName('index', [$column['name']]);
+                }
+            }
+        }
+
+        // Track processed indexes to prevent duplicates
+        $processedIndexes = [];
+
+        // 1. Önce indeksleri kaldır
+        foreach ($existingIndexesMap as $indexName => $existingIndex) {
+            if (!in_array($indexName, $migrationIndexNames) && $indexName !== 'PRIMARY' && !in_array($indexName, $processedIndexes)) {
+                // Foreign key constraint için kullanılan bir index mi kontrol et
+                if (in_array($indexName, $foreignKeyIndexes)) {
+                    // İlgili foreign key constraint'i bul ve kaldır
+                    foreach ($foreignKeys as $fk) {
+                        if ($fk->CONSTRAINT_NAME === $indexName || 
+                            $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign' === $indexName) {
+                            $changesDetected = true;
+                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`";
+                            $this->line("    * Dropping foreign key constraint {$fk->CONSTRAINT_NAME} before removing index");
+                        }
+                    }
+                }
+                
+                $changesDetected = true;
+                $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
+                $this->line("    * Dropping index {$indexName} (not in migration)");
+                $processedIndexes[] = $indexName;
+            }
+        }
+        
+        // 2. Sonra kolonları kaldır
         foreach ($existingColumnsMap as $columnName => $existingColumn) {
             if (!in_array($columnName, $migrationColumnNames)) {
                 // Ama id sütununu asla silme
@@ -477,33 +525,6 @@ class FetchDatabaseSchemaCommand extends Command
             }
         }
         
-        // Şimdi de veritabanında olup migration dosyasında olmayan indeksleri kontrol edelim
-        $migrationIndexNames = array_map(function($index) {
-            return $index['name'];
-        }, $migrationSchema['indexes']);
-        
-        foreach ($existingIndexesMap as $indexName => $existingIndex) {
-            if (!in_array($indexName, $migrationIndexNames) && $indexName !== 'PRIMARY') {
-                // Foreign key constraint için kullanılan bir index mi kontrol et
-                if (in_array($indexName, $foreignKeyIndexes)) {
-                    // İlgili foreign key constraint'i bul ve kaldır
-                    foreach ($foreignKeys as $fk) {
-                        if ($fk->CONSTRAINT_NAME === $indexName || 
-                            $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign' === $indexName) {
-                            $changesDetected = true;
-                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`";
-                            $this->line("    * Dropping foreign key constraint {$fk->CONSTRAINT_NAME} before removing index");
-                        }
-                    }
-                }
-                
-                // Bu indeks migration dosyasında yok, silelim
-                $changesDetected = true;
-                $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
-                $this->line("    * Dropping index {$indexName} (not in migration)");
-            }
-        }
-        
         // Execute ALTER statements only if changes are detected
         if ($changesDetected) {
             if (!empty($alterStatements)) {
@@ -544,6 +565,37 @@ class FetchDatabaseSchemaCommand extends Command
      */
     protected function columnNeedsUpdate(array $migrationColumn, object $existingColumn): bool
     {
+        // İlk önce temel özellikleri kontrol et
+        $currentIndexName = $this->generateIndexName('index', [$existingColumn->Field]);
+        $currentUniqueIndexName = $this->generateIndexName('unique', [$existingColumn->Field]);
+        
+        // Migration'da index/unique tanımlı mı?
+        $shouldHaveIndex = isset($migrationColumn['modifiers']['index']);
+        $shouldHaveUnique = isset($migrationColumn['modifiers']['unique']);
+        
+        // Mevcut durumda index/unique var mı?
+        $hasIndex = false;
+        $hasUnique = false;
+        
+        // Mevcut indeksleri kontrol et
+        $existingIndexes = $this->getTableIndexes($this->currentTable);
+        foreach ($existingIndexes as $index) {
+            if ($index->Column_name === $existingColumn->Field) {
+                if ($index->Non_unique == 0) {
+                    $hasUnique = true;
+                } else {
+                    $hasIndex = true;
+                }
+            }
+        }
+        
+        // Index durumlarını kontrol et
+        if (($shouldHaveIndex && !$hasIndex) || ($shouldHaveUnique && !$hasUnique) ||
+            ($hasIndex && !$shouldHaveIndex) || ($hasUnique && !$shouldHaveUnique)) {
+            $this->line("    * Column {$existingColumn->Field}: Index modification needed");
+            return true;
+        }
+
         // Compare column type
         $migrationColumnType = $this->mapLaravelTypeToMySQLType($migrationColumn['type'], $migrationColumn['params']);
         $currentColumnType = strtolower($existingColumn->Type);
