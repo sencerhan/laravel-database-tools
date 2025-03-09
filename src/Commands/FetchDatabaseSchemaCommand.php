@@ -40,6 +40,13 @@ class FetchDatabaseSchemaCommand extends Command
     protected $description = 'Update database schema to match migration files';
 
     /**
+     * Current table being processed
+     * 
+     * @var string|null
+     */
+    protected $currentTable = null;
+
+    /**
      * Execute the console command.
      *
      * @return int
@@ -106,6 +113,9 @@ class FetchDatabaseSchemaCommand extends Command
     {
         $this->info("\nProcessing table: {$table}");
         
+        // Store the current table name
+        $this->currentTable = $table;
+        
         // Find migration file for table
         $migrationFile = $this->findMigrationFile($table);
         
@@ -118,6 +128,7 @@ class FetchDatabaseSchemaCommand extends Command
         
         // Extract migration schema data
         $migrationSchema = $this->extractMigrationSchema($migrationFile, $table);
+        
         if (empty($migrationSchema)) {
             $this->warn("  Could not extract schema from migration file");
             return;
@@ -144,7 +155,7 @@ class FetchDatabaseSchemaCommand extends Command
         if (count($migrations) > 0) {
             return $migrations[0];
         }
-        
+                
         // Also search for migrations that might have different naming pattern
         $migrations = File::glob(database_path('migrations/*_' . $table . '.php'));
         
@@ -204,28 +215,53 @@ class FetchDatabaseSchemaCommand extends Command
                 continue;
             }
             
-            // Check for softDeletes method
-            if (strpos($line, '$table->softDeletes') !== false) {
-                $columns[] = [
-                    'type' => 'timestamp',
-                    'name' => 'deleted_at',
-                    'params' => [],
-                    'modifiers' => ['nullable' => true],
+            if (empty($line)) {
+                continue;
+            }
+
+            // Extract direct index definitions (like $table->index(['slug'], 'name'))
+            if (preg_match('/\$table->(index|unique)\(\[([^\]]+)\](?:,\s*[\'"]([^\'"]+)[\'"]\s*)?\);/', $line, $matches)) {
+                $indexType = $matches[1];
+                $indexColumns = array_map(function($col) {
+                    return trim($col, '\'" '); // Temizle
+                }, explode(',', $matches[2]));
+                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
+                
+                $indexes[] = [
+                    'type' => $indexType,
+                    'columns' => $indexColumns,
+                    'name' => $indexName,
                     'original' => $line
                 ];
                 continue;
             }
             
-            if (empty($line)) {
-                continue;
-            }
-            
-            // Extract column definitions (improved regex to match more patterns)
+            // Extract column definitions with potential index modifiers
             if (preg_match('/\$table->([a-zA-Z0-9_]+)\((?:[\'"](.*?)[\'"])?(?:,?\s*(.*?))?\)((?:->.*?)*);/', $line, $matches)) {
                 $columnType = $matches[1];
                 $columnName = $matches[2] ?? '';
                 $columnParams = isset($matches[3]) && !empty(trim($matches[3])) ? explode(',', $matches[3]) : [];
                 $modifiers = $matches[4] ?? '';
+                
+                // Check for index() modifier in the column definition
+                if (preg_match('/->index\(\)/', $modifiers)) {
+                    $indexes[] = [
+                        'type' => 'index',
+                        'columns' => [$columnName],
+                        'name' => $this->generateIndexName('index', [$columnName]),
+                        'original' => $line
+                    ];
+                }
+                
+                // Check for unique() modifier in the column definition
+                if (preg_match('/->unique\(\)/', $modifiers)) {
+                    $indexes[] = [
+                        'type' => 'unique',
+                        'columns' => [$columnName],
+                        'name' => $this->generateIndexName('unique', [$columnName]),
+                        'original' => $line
+                    ];
+                }
                 
                 // Handle special case for array_column with enum
                 if (strpos($line, 'array_column') !== false) {
@@ -244,20 +280,7 @@ class FetchDatabaseSchemaCommand extends Command
                     'modifiers' => $this->parseModifiers($modifiers),
                     'original' => $line
                 ];
-            }
-            
-            // Extract index definitions (improved regex to match more patterns)
-            else if (preg_match('/\$table->([a-zA-Z0-9_]+)\(\[(.*?)\],?\s*(?:[\'"](.+?)[\'"]\s*)?\);/', $line, $matches)) {
-                $indexType = $matches[1]; // unique, index, etc.
-                $indexColumns = array_map('trim', explode("','", str_replace(["'", '"'], '', $matches[2])));
-                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
-                
-                $indexes[] = [
-                    'type' => $indexType,
-                    'columns' => $indexColumns,
-                    'name' => $indexName,
-                    'original' => $line
-                ];
+                continue;
             }
         }
         
@@ -324,7 +347,6 @@ class FetchDatabaseSchemaCommand extends Command
         // Get current table columns
         $existingColumns = $this->getTableColumns($table);
         $existingColumnsMap = [];
-        
         foreach ($existingColumns as $column) {
             $existingColumnsMap[$column->Field] = $column;
         }
@@ -332,6 +354,10 @@ class FetchDatabaseSchemaCommand extends Command
         // Get current indexes
         $existingIndexes = $this->getTableIndexes($table);
         $existingIndexesMap = $this->groupIndexes($existingIndexes);
+        
+        // Get foreign keys to avoid dropping indexes needed for foreign keys
+        $foreignKeys = $this->getTableForeignKeys($table);
+        $foreignKeyIndexes = $this->extractForeignKeyIndexes($foreignKeys);
         
         // Generate SQL to modify table
         $alterStatements = [];
@@ -379,6 +405,15 @@ class FetchDatabaseSchemaCommand extends Command
             if (!in_array($columnName, $migrationColumnNames)) {
                 // Ama id sütununu asla silme
                 if ($columnName !== 'id') {
+                    // Foreign key constraint var mı kontrol et
+                    $constraints = $this->getForeignKeyConstraints($table, $columnName);
+                    if (!empty($constraints)) {
+                        foreach ($constraints as $constraint) {
+                            $changesDetected = true;
+                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$constraint->CONSTRAINT_NAME}`";
+                            $this->line("    * Dropping foreign key constraint {$constraint->CONSTRAINT_NAME}");
+                        }
+                    }
                     $changesDetected = true;
                     $alterStatements[] = $this->generateDropColumnSQL($table, $columnName);
                     $this->line("    * Dropping column {$columnName} (not in migration)");
@@ -420,8 +455,7 @@ class FetchDatabaseSchemaCommand extends Command
             }
         }
         
-        // Process indexes from migration and check for missing indexes
-        // Önce migration dosyasında tanımlı indekslerin veritabanında olup olmadığını kontrol edelim
+        // Process indexes from migration
         foreach ($migrationSchema['indexes'] as $index) {
             $indexName = $index['name'];
             
@@ -450,6 +484,19 @@ class FetchDatabaseSchemaCommand extends Command
         
         foreach ($existingIndexesMap as $indexName => $existingIndex) {
             if (!in_array($indexName, $migrationIndexNames) && $indexName !== 'PRIMARY') {
+                // Foreign key constraint için kullanılan bir index mi kontrol et
+                if (in_array($indexName, $foreignKeyIndexes)) {
+                    // İlgili foreign key constraint'i bul ve kaldır
+                    foreach ($foreignKeys as $fk) {
+                        if ($fk->CONSTRAINT_NAME === $indexName || 
+                            $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign' === $indexName) {
+                            $changesDetected = true;
+                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`";
+                            $this->line("    * Dropping foreign key constraint {$fk->CONSTRAINT_NAME} before removing index");
+                        }
+                    }
+                }
+                
                 // Bu indeks migration dosyasında yok, silelim
                 $changesDetected = true;
                 $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
@@ -462,16 +509,13 @@ class FetchDatabaseSchemaCommand extends Command
             if (!empty($alterStatements)) {
                 $this->info("  Executing " . count($alterStatements) . " ALTER statements...");
                 
-                foreach ($alterStatements as $sql) {
-                    try {
-                        $this->line("    - " . $sql);
-                        DB::statement($sql);
-                    } catch (\Exception $e) {
-                        $this->error("    ! Error executing SQL: " . $e->getMessage());
-                    }
-                }
+                [$success, $completed] = $this->executeBatchStatements($alterStatements);
                 
-                $this->info("  Table {$table} updated successfully.");
+                if ($success) {
+                    $this->info("  Table {$table} updated successfully.");
+                } else {
+                    $this->warn("  Table {$table} partially updated ({$completed}/" . count($alterStatements) . " operations completed).");
+                }
             }
         } else {
             $this->info("  Table {$table} already matches migration. No changes needed.");
@@ -537,7 +581,7 @@ class FetchDatabaseSchemaCommand extends Command
     
     /**
      * Compare default values with special handling
-     * 
+     *
      * @param mixed $default1
      * @param mixed $default2
      * @return bool
@@ -661,7 +705,7 @@ class FetchDatabaseSchemaCommand extends Command
                 return 'json';
                 
             case 'enum':
-                return 'enum'; // Special handling needed for enum values
+                return 'enum';
                 
             case 'uuid':
                 return 'char(36)';
@@ -693,7 +737,6 @@ class FetchDatabaseSchemaCommand extends Command
         // Extract base type without size/length
         preg_match('/^([a-z]+)/', $type1, $matches1);
         preg_match('/^([a-z]+)/', $type2, $matches2);
-        
         $baseType1 = $matches1[1] ?? $type1;
         $baseType2 = $matches2[1] ?? $type2;
         
@@ -726,20 +769,20 @@ class FetchDatabaseSchemaCommand extends Command
     {
         $sqlType = $this->mapLaravelTypeToMySQLType($column['type'], $column['params']);
         $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
-        $default = '';
         
         if (isset($column['modifiers']['default'])) {
             $defaultVal = $column['modifiers']['default'];
-            
+            // Remove quotes if they're already in the default value
+            $defaultVal = trim($defaultVal, "'\"");
             if ($defaultVal === 'CURRENT_TIMESTAMP') {
                 $default = "DEFAULT CURRENT_TIMESTAMP";
             } else if (is_numeric($defaultVal) && !str_starts_with($defaultVal, "'") && !str_starts_with($defaultVal, '"')) {
                 $default = "DEFAULT {$defaultVal}";
             } else {
-                // Remove quotes if they're already in the default value
-                $defaultVal = trim($defaultVal, "'\"");
                 $default = "DEFAULT '{$defaultVal}'";
             }
+        } else {
+            $default = '';
         }
         
         return "ALTER TABLE `{$table}` MODIFY COLUMN `{$column['name']}` {$sqlType} {$nullable} {$default}";
@@ -756,20 +799,20 @@ class FetchDatabaseSchemaCommand extends Command
     {
         $sqlType = $this->mapLaravelTypeToMySQLType($column['type'], $column['params']);
         $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
-        $default = '';
         
         if (isset($column['modifiers']['default'])) {
             $defaultVal = $column['modifiers']['default'];
-            
+            // Remove quotes if they're already in the default value
+            $defaultVal = trim($defaultVal, "'\"");
             if ($defaultVal === 'CURRENT_TIMESTAMP') {
                 $default = "DEFAULT CURRENT_TIMESTAMP";
             } else if (is_numeric($defaultVal) && !str_starts_with($defaultVal, "'") && !str_starts_with($defaultVal, '"')) {
                 $default = "DEFAULT {$defaultVal}";
             } else {
-                // Remove quotes if they're already in the default value
-                $defaultVal = trim($defaultVal, "'\"");
                 $default = "DEFAULT '{$defaultVal}'";
             }
+        } else {
+            $default = '';
         }
         
         // Special handling for enum type
@@ -845,10 +888,9 @@ class FetchDatabaseSchemaCommand extends Command
         // Check if index columns are different
         $migrationColumns = $migrationIndex['columns'];
         $existingColumns = $existingIndex['columns'];
-        
         sort($migrationColumns);
         sort($existingColumns);
-        
+                
         if ($migrationColumns !== $existingColumns) {
             $migrationColumnsList = implode(', ', $migrationColumns);
             $existingColumnsList = implode(', ', $existingColumns);
@@ -916,7 +958,7 @@ class FetchDatabaseSchemaCommand extends Command
 
     /**
      * Handle special column naming conventions and alternatives
-     * 
+     *
      * @param string $columnName
      * @return bool|string Returns false if not a special column, or the canonical name if it is
      */
@@ -945,7 +987,7 @@ class FetchDatabaseSchemaCommand extends Command
 
     /**
      * Generate a standard index name when none is provided
-     * 
+     *
      * @param string $type
      * @param array $columns
      * @return string
@@ -954,5 +996,121 @@ class FetchDatabaseSchemaCommand extends Command
     {
         $prefix = $type === 'unique' ? 'unique' : 'index';
         return $prefix . '_' . implode('_', $columns);
+    }
+
+    /**
+     * Get foreign keys for a table
+     *
+     * @param string $table
+     * @return array
+     */
+    protected function getTableForeignKeys(string $table): array
+    {
+        try {
+            return DB::select("
+                SELECT 
+                    CONSTRAINT_NAME,
+                    COLUMN_NAME,
+                    REFERENCED_TABLE_NAME,
+                    REFERENCED_COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE 
+                    TABLE_SCHEMA = ? AND
+                    TABLE_NAME = ? AND
+                    REFERENCED_TABLE_NAME IS NOT NULL
+            ", [config('database.connections.mysql.database'), $table]);
+        } catch (\Exception $e) {
+            $this->warn("  Could not retrieve foreign key information: " . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Extract index names that are used by foreign keys
+     *
+     * @param array $foreignKeys
+     * @return array
+     */
+    protected function extractForeignKeyIndexes(array $foreignKeys): array
+    {
+        $indexes = [];
+        foreach ($foreignKeys as $fk) {
+            // Standard MySQL foreign key index naming
+            $indexes[] = $fk->CONSTRAINT_NAME;
+            
+            // Laravel's standard foreign key index naming patterns
+            $indexes[] = $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign';
+            $indexes[] = $fk->COLUMN_NAME . '_foreign'; // Bazı durumlarda tablo adı olmadan
+            $indexes[] = 'fk_' . $this->currentTable . '_' . $fk->COLUMN_NAME; // Alternatif naming pattern
+            
+            // Tek sütunlu unique index durumu
+            $indexes[] = 'idx_' . $this->currentTable . '_' . $fk->COLUMN_NAME;
+            $indexes[] = 'idx_' . $fk->COLUMN_NAME;
+        }
+        return array_unique($indexes);
+    }
+
+    /**
+     * Get foreign key constraints for a specific column
+     *
+     * @param string $table
+     * @param string $column
+     * @return array
+     */
+    protected function getForeignKeyConstraints(string $table, string $column): array
+    {
+        try {
+            return DB::select("
+                SELECT 
+                    CONSTRAINT_NAME,
+                    COLUMN_NAME,
+                    REFERENCED_TABLE_NAME,
+                    REFERENCED_COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE 
+                    TABLE_SCHEMA = ? AND
+                    TABLE_NAME = ? AND
+                    COLUMN_NAME = ? AND
+                    REFERENCED_TABLE_NAME IS NOT NULL
+            ", [
+                config('database.connections.mysql.database'),
+                $table,
+                $column
+            ]);
+        } catch (\Exception $e) {
+            $this->warn("  Could not retrieve foreign key constraint information: " . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Execute a batch of SQL statements with proper error handling
+     *
+     * @param array $statements
+     * @param bool $continueOnError
+     * @return array [bool $success, int $completed]
+     */
+    protected function executeBatchStatements(array $statements, bool $continueOnError = true): array
+    {
+        $success = true;
+        $completed = 0;
+
+        foreach ($statements as $sql) {
+            try {
+                $this->line("    - " . $sql);
+                DB::statement($sql);
+                $completed++;
+            } catch (\Exception $e) {
+                $this->error("    ! Error executing SQL: " . $e->getMessage());
+                
+                if (!$continueOnError) {
+                    return [false, $completed];
+                }
+                
+                $success = false;
+            }
+        }
+
+        return [$success, $completed];
     }
 }
