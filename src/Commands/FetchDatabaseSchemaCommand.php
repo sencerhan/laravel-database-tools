@@ -190,10 +190,18 @@ class FetchDatabaseSchemaCommand extends Command
         $lines = explode("\n", $schemaBlock);
         $columns = [];
         $indexes = [];
+        $hasTimestamps = false;
         
         foreach ($lines as $line) {
             $line = trim($line);
-            if (empty($line) || $line === '$table->timestamps();') {
+            
+            // Check for timestamps method
+            if ($line === '$table->timestamps();') {
+                $hasTimestamps = true;
+                continue;
+            }
+            
+            if (empty($line)) {
                 continue;
             }
             
@@ -240,7 +248,8 @@ class FetchDatabaseSchemaCommand extends Command
         
         return [
             'columns' => $columns,
-            'indexes' => $indexes
+            'indexes' => $indexes,
+            'hasTimestamps' => $hasTimestamps
         ];
     }
 
@@ -331,6 +340,19 @@ class FetchDatabaseSchemaCommand extends Command
                 // Column doesn't exist, add it
                 $changesDetected = true;
                 $alterStatements[] = $this->generateAddColumnSQL($table, $column);
+            }
+        }
+        
+        // Handle timestamps if they are defined in migration
+        if (!empty($migrationSchema['hasTimestamps'])) {
+            $timestampColumns = ['created_at', 'updated_at'];
+            foreach ($timestampColumns as $timestampColumn) {
+                if (!isset($existingColumnsMap[$timestampColumn])) {
+                    // Add timestamp column if it doesn't exist
+                    $changesDetected = true;
+                    $alterStatements[] = "ALTER TABLE `{$table}` ADD COLUMN `{$timestampColumn}` TIMESTAMP NULL";
+                    $this->line("    * Adding timestamp column {$timestampColumn}");
+                }
             }
         }
         
