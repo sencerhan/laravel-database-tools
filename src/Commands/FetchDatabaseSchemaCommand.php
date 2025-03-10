@@ -45,6 +45,13 @@ class FetchDatabaseSchemaCommand extends Command
      * @var string|null
      */
     protected $currentTable = null;
+    
+    /**
+     * Additional ALTER statements to be executed
+     * 
+     * @var array
+     */
+    protected $additionalAlterStatements = [];
 
     /**
      * Execute the console command.
@@ -206,88 +213,134 @@ class FetchDatabaseSchemaCommand extends Command
         
         foreach ($lines as $line) {
             $line = trim($line);
-            
-            // Check for timestamps method (both standard and commented variations)
-            if ($line === '$table->timestamps();' || 
-                preg_match('/\/\/\s*\$table->timestamps\(\);/', $line) || 
-                preg_match('/\/\*\s*\$table->timestamps\(\);\s*\*\//', $line)) {
+            if (empty($line)) continue;
+
+            // Debug output
+            $this->line("    * Processing line: " . $line);
+
+            // Check for timestamps
+            if (preg_match('/\$table->timestamps\(\)/', $line)) {
                 $hasTimestamps = true;
                 continue;
             }
-            
-            if (empty($line)) {
-                continue;
+
+            // Check for direct index definitions like $table->index(['col1', 'col2'])
+            if (preg_match('/\$table->(?:index|unique)\(\[(.*?)\]\)/', $line, $indexMatch)) {
+                preg_match_all('/[\'"]([^\'"]+)[\'"]/', $indexMatch[1], $columnMatches);
+                if (!empty($columnMatches[1])) {
+                    $indexColumns = $columnMatches[1];
+                    $indexType = strpos($line, '->unique') !== false ? 'unique' : 'index';
+                    $indexes[] = [
+                        'type' => $indexType,
+                        'columns' => $indexColumns,
+                        'name' => $this->generateIndexName($indexType, $indexColumns),
+                        'original' => $line
+                    ];
+                    $this->line("    * Added composite {$indexType} for columns: " . implode(', ', $indexColumns));
+                    continue;
+                }
             }
 
-            // Extract direct index definitions (like $table->index(['slug'], 'name'))
-            if (preg_match('/\$table->(index|unique)\(\[([^\]]+)\](?:,\s*[\'"]([^\'"]+)[\'"]\s*)?\);/', $line, $matches)) {
-                $indexType = $matches[1];
-                $indexColumns = array_map(function($col) {
-                    return trim($col, '\'" '); // Temizle
-                }, explode(',', $matches[2]));
-                $indexName = $matches[3] ?? $this->generateIndexName($indexType, $indexColumns);
-                
-                $indexes[] = [
-                    'type' => $indexType,
-                    'columns' => $indexColumns,
-                    'name' => $indexName,
-                    'original' => $line
-                ];
-                continue;
-            }
-            
-            // Extract column definitions with potential index modifiers
-            if (preg_match('/\$table->([a-zA-Z0-9_]+)\((?:[\'"](.*?)[\'"])?(?:,?\s*(.*?))?\)((?:->.*?)*);/', $line, $matches)) {
-                $columnType = $matches[1];
-                $columnName = $matches[2] ?? '';
-                $columnParams = isset($matches[3]) && !empty(trim($matches[3])) ? explode(',', $matches[3]) : [];
-                $modifiers = $matches[4] ?? '';
-                
-                // Check for index() modifier in the column definition
-                if (preg_match('/->index\(\)/', $modifiers)) {
-                    $indexes[] = [
-                        'type' => 'index',
-                        'columns' => [$columnName],
-                        'name' => $this->generateIndexName('index', [$columnName]),
-                        'original' => $line
-                    ];
-                }
-                
-                // Check for unique() modifier in the column definition
-                if (preg_match('/->unique\(\)/', $modifiers)) {
-                    $indexes[] = [
-                        'type' => 'unique',
-                        'columns' => [$columnName],
-                        'name' => $this->generateIndexName('unique', [$columnName]),
-                        'original' => $line
-                    ];
-                }
-                
-                // Handle special case for array_column with enum
-                if (strpos($line, 'array_column') !== false) {
-                    preg_match('/\$table->enum\([\'"](.+?)[\'"],\s*array_column\(.*?::cases\(\),\s*[\'"]value[\'"]\)\)((?:->.*?)*);/', $line, $enumMatches);
-                    if (!empty($enumMatches)) {
-                        $columnType = 'enum';
-                        $columnName = $enumMatches[1];
-                        $modifiers = $enumMatches[2] ?? '';
+            // Enhanced column pattern matching with support for array parameters
+            if (preg_match('/\$table->([a-zA-Z0-9_]+)\((.*?)\)((?:->.*?)*);/', $line, $matches)) {
+                $type = $matches[1];
+                $params = $matches[2];
+                $modifiers = $matches[3] ?? '';
+
+                // Extract column name and parameters, supporting arrays
+                $name = '';
+                $columnParams = [];
+
+                if (in_array($type, ['foreignId', 'unsignedBigInteger'])) {
+                    $name = trim($params, "'\" ");
+                } else if (strpos($params, '[') !== false) {
+                    // Handle array parameters
+                    preg_match_all('/[\'"]([^\'"]+)[\'"]/', $params, $paramMatches);
+                    if (!empty($paramMatches[1])) {
+                        $columnParams = $paramMatches[1];
+                        $name = array_shift($columnParams); // First element is usually the column name
+                    }
+                } else if (preg_match('/[\'"]([^\'"]+)[\'"]/', $params, $nameMatch)) {
+                    $name = $nameMatch[1];
+                    $paramStr = preg_replace('/[\'"]' . $name . '[\'"](\s*,\s*)?/', '', $params);
+                    if (!empty($paramStr)) {
+                        $columnParams = array_map('trim', explode(',', $paramStr));
                     }
                 }
-                
-                $columns[] = [
-                    'type' => $columnType,
-                    'name' => $columnName,
-                    'params' => array_map('trim', $columnParams),
-                    'modifiers' => $this->parseModifiers($modifiers),
-                    'original' => $line
-                ];
-                continue;
+
+                // Handle index modifiers better
+                $hasIndex = preg_match('/->index\(\)/', $modifiers) || 
+                           strpos($modifiers, '->index()') !== false ||
+                           preg_match('/->index\([\'"]?([^\'"]*)[\'"]?\)/', $modifiers);
+
+                if (!empty($name)) {
+                    // Parse modifiers including defaults and indexes
+                    $columnModifiers = $this->parseModifiers($modifiers);
+
+                    // Add column to schema
+                    $columns[] = [
+                        'type' => $type,
+                        'name' => $name,
+                        'params' => $columnParams,
+                        'modifiers' => $columnModifiers,
+                        'original' => $line
+                    ];
+
+                    $this->line("    * Found column: {$name} ({$type})");
+
+                    // Handle indexes from modifiers
+                    if ($hasIndex || isset($columnModifiers['index'])) {
+                        $indexes[] = [
+                            'type' => 'index',
+                            'columns' => [$name],
+                            'name' => $this->generateIndexName('index', [$name]),
+                            'original' => $line
+                        ];
+                        $this->line("    * Added index for column: {$name}");
+                    }
+                    if (isset($columnModifiers['unique']) || strpos($modifiers, '->unique()') !== false) {
+                        $indexes[] = [
+                            'type' => 'unique',
+                            'columns' => [$name],
+                            'name' => $this->generateIndexName('unique', [$name]),
+                            'original' => $line
+                        ];
+                        $this->line("    * Added unique index for column: {$name}");
+                    }
+                }
             }
         }
-        
+
+        // Check for SoftDeletes trait usage
+        $hasSoftDeletes = false;
+        if (strpos($schemaBlock, 'SoftDeletes') !== false || 
+            strpos($schemaBlock, '->softDeletes()') !== false) {
+            $hasSoftDeletes = true;
+        }
+
+        // Parse complex index definitions
+        if (preg_match_all('/\$table->index\(\[(.*?)\]\)/', $schemaBlock, $matches)) {
+            foreach ($matches[1] as $indexColumns) {
+                // Parse column names from the array syntax
+                preg_match_all('/[\'"]([^\'"]+)[\'"]/', $indexColumns, $columnMatches);
+                if (!empty($columnMatches[1])) {
+                    $indexColumns = $columnMatches[1];
+                    $indexes[] = [
+                        'type' => 'index',
+                        'columns' => $indexColumns,
+                        'name' => $this->generateIndexName('index', $indexColumns),
+                        'original' => $matches[0][0]
+                    ];
+                    $this->line("    * Added composite index for columns: " . implode(', ', $indexColumns));
+                }
+            }
+        }
+
         return [
             'columns' => $columns,
             'indexes' => $indexes,
-            'hasTimestamps' => $hasTimestamps
+            'hasTimestamps' => $hasTimestamps,
+            'hasSoftDeletes' => $hasSoftDeletes  // New property
         ];
     }
 
@@ -304,39 +357,29 @@ class FetchDatabaseSchemaCommand extends Command
         if (empty($modifiersStr)) {
             return $modifiers;
         }
-        
-        // Extract modifier patterns
-        if (strpos($modifiersStr, '->nullable()') !== false) {
-            $modifiers['nullable'] = true;
-        }
-        
-        if (preg_match('/->default\((.*?)\)/', $modifiersStr, $matches)) {
-            // Handle quoted strings and non-quoted values
-            $defaultValue = trim($matches[1]);
-            $modifiers['default'] = $defaultValue;
-        }
-        
-        if (strpos($modifiersStr, '->useCurrent()') !== false) {
-            $modifiers['default'] = 'CURRENT_TIMESTAMP';
-        }
-        
-        if (preg_match('/->comment\([\'"](.+?)[\'"]\)/', $modifiersStr, $matches)) {
-            $modifiers['comment'] = $matches[1];
-        }
-        
-        if (strpos($modifiersStr, '->autoIncrement()') !== false) {
-            $modifiers['autoIncrement'] = true;
-        }
-        
-        if (strpos($modifiersStr, '->unique()') !== false) {
-            $modifiers['unique'] = true;
-        }
 
-        // Yeni: index() modifier'ını yakala
-        if (strpos($modifiersStr, '->index()') !== false) {
+        // Better index detection
+        if (preg_match('/->index\(\)/', $modifiersStr) || 
+            preg_match('/->index\([\'"]?([^\'"]*)[\'"]?\)/', $modifiersStr)) {
             $modifiers['index'] = true;
         }
-        
+
+        // Extract all modifiers with their parameters
+        preg_match_all('/->([a-zA-Z]+)\((.*?)\)/', $modifiersStr, $matches, PREG_SET_ORDER);
+        foreach ($matches as $match) {
+            $modifier = $match[1];
+            $value = trim($match[2], "'\"");
+            $modifiers[$modifier] = $value;
+        }
+
+        // Extract flag modifiers (without parameters)
+        $flagModifiers = ['nullable', 'unsigned', 'unique'];
+        foreach ($flagModifiers as $modifier) {
+            if (strpos($modifiersStr, "->{$modifier}()") !== false) {
+                $modifiers[$modifier] = true;
+            }
+        }
+
         return $modifiers;
     }
 
@@ -490,12 +533,11 @@ class FetchDatabaseSchemaCommand extends Command
             }
         }
         
-        // Handle timestamps if they are defined in migration
+        // Handle timestamps if they are defined in migration - FIX HERE
         if (!empty($migrationSchema['hasTimestamps'])) {
-            $timestampColumns = ['created_at', 'updated_at'];
+            $timestampColumns = ['created_at', 'updated_at'];  // Removed deleted_at
             foreach ($timestampColumns as $timestampColumn) {
                 if (!isset($existingColumnsMap[$timestampColumn])) {
-                    // Add timestamp column if it doesn't exist
                     $changesDetected = true;
                     $alterStatements[] = "ALTER TABLE `{$table}` ADD COLUMN `{$timestampColumn}` TIMESTAMP NULL";
                     $this->line("    * Adding timestamp column {$timestampColumn}");
@@ -565,43 +607,23 @@ class FetchDatabaseSchemaCommand extends Command
      */
     protected function columnNeedsUpdate(array $migrationColumn, object $existingColumn): bool
     {
-        // İlk önce temel özellikleri kontrol et
-        $currentIndexName = $this->generateIndexName('index', [$existingColumn->Field]);
-        $currentUniqueIndexName = $this->generateIndexName('unique', [$existingColumn->Field]);
-        
-        // Migration'da index/unique tanımlı mı?
-        $shouldHaveIndex = isset($migrationColumn['modifiers']['index']);
-        $shouldHaveUnique = isset($migrationColumn['modifiers']['unique']);
-        
-        // Mevcut durumda index/unique var mı?
-        $hasIndex = false;
-        $hasUnique = false;
-        
-        // Mevcut indeksleri kontrol et
-        $existingIndexes = $this->getTableIndexes($this->currentTable);
-        foreach ($existingIndexes as $index) {
-            if ($index->Column_name === $existingColumn->Field) {
-                if ($index->Non_unique == 0) {
-                    $hasUnique = true;
-                } else {
-                    $hasIndex = true;
-                }
-            }
-        }
-        
-        // Index durumlarını kontrol et
-        if (($shouldHaveIndex && !$hasIndex) || ($shouldHaveUnique && !$hasUnique) ||
-            ($hasIndex && !$shouldHaveIndex) || ($hasUnique && !$shouldHaveUnique)) {
-            $this->line("    * Column {$existingColumn->Field}: Index modification needed");
-            return true;
+        // Skip if this is an index definition
+        if ($migrationColumn['type'] === 'index') {
+            return false;
         }
 
-        // Compare column type
+        // Debug output with more detail for decimal types
+        $this->line("    * Checking column {$existingColumn->Field}:");
+        $this->line("      - Migration type: {$migrationColumn['type']}");
+        $this->line("      - Migration params: " . json_encode($migrationColumn['params']));
+        $this->line("      - Current type: {$existingColumn->Type}");
+        
+        // Compare types
         $migrationColumnType = $this->mapLaravelTypeToMySQLType($migrationColumn['type'], $migrationColumn['params']);
         $currentColumnType = strtolower($existingColumn->Type);
         
         if (!$this->columnTypesMatch($migrationColumnType, $currentColumnType)) {
-            $this->line("    * Column {$existingColumn->Field}: Type mismatch - Migration: {$migrationColumnType}, Current: {$currentColumnType}");
+            $this->line("      * Type mismatch - Migration: {$migrationColumnType}, Current: {$currentColumnType}");
             return true;
         }
         
@@ -610,9 +632,8 @@ class FetchDatabaseSchemaCommand extends Command
         $currentNullable = $existingColumn->Null === 'YES';
         
         if ($migrationNullable !== $currentNullable) {
-            $migrationNullText = $migrationNullable ? 'NULL' : 'NOT NULL';
-            $currentNullText = $currentNullable ? 'NULL' : 'NOT NULL';
-            $this->line("    * Column {$existingColumn->Field}: Nullable mismatch - Migration: {$migrationNullText}, Current: {$currentNullText}");
+            $this->line("      * Nullable mismatch - Migration: " . ($migrationNullable ? 'YES' : 'NO') . 
+                        ", Current: " . ($currentNullable ? 'YES' : 'NO'));
             return true;
         }
         
@@ -620,14 +641,13 @@ class FetchDatabaseSchemaCommand extends Command
         $migrationDefault = $migrationColumn['modifiers']['default'] ?? null;
         $currentDefault = $existingColumn->Default;
         
-        // Special handling for defaults to avoid unnecessary updates
         if ($this->defaultsAreDifferent($migrationDefault, $currentDefault)) {
-            $migrationDefaultText = is_null($migrationDefault) ? 'NULL' : $migrationDefault;
-            $currentDefaultText = is_null($currentDefault) ? 'NULL' : $currentDefault;
-            $this->line("    * Column {$existingColumn->Field}: Default mismatch - Migration: {$migrationDefaultText}, Current: {$currentDefaultText}");
+            $this->line("      * Default value mismatch - Migration: " . 
+                        (is_null($migrationDefault) ? 'NULL' : $migrationDefault) . 
+                        ", Current: " . (is_null($currentDefault) ? 'NULL' : $currentDefault));
             return true;
         }
-        
+
         return false;
     }
     
@@ -719,8 +739,12 @@ class FetchDatabaseSchemaCommand extends Command
                 return 'mediumint(8) unsigned';
                 
             case 'decimal':
-                $precision = !empty($params[0]) ? trim($params[0]) : 8;
-                $scale = !empty($params[1]) ? trim($params[1]) : 2;
+                // Ensure proper parameter handling
+                $precision = $scale = 0;
+                if (!empty($params)) {
+                    $precision = (int)trim($params[0] ?? '8');
+                    $scale = (int)trim($params[1] ?? '2');
+                }
                 return "decimal({$precision},{$scale})";
                 
             case 'float':
@@ -757,7 +781,14 @@ class FetchDatabaseSchemaCommand extends Command
                 return 'json';
                 
             case 'enum':
-                return 'enum';
+                // For enum types, use the actual values if available
+                if (!empty($params)) {
+                    $values = implode("','", array_map(function($val) {
+                        return trim($val, "'\"");
+                    }, $params));
+                    return "enum('{$values}')";
+                }
+                return "varchar(191)";
                 
             case 'uuid':
                 return 'char(36)';
@@ -786,12 +817,15 @@ class FetchDatabaseSchemaCommand extends Command
         $type1 = strtolower($type1);
         $type2 = strtolower($type2);
         
-        // Extract base type without size/length
-        preg_match('/^([a-z]+)/', $type1, $matches1);
-        preg_match('/^([a-z]+)/', $type2, $matches2);
-        $baseType1 = $matches1[1] ?? $type1;
-        $baseType2 = $matches2[1] ?? $type2;
+        // Extract type and length/precision information
+        preg_match('/^([a-z]+)(?:\((.*?)\))?$/', $type1, $m1);
+        preg_match('/^([a-z]+)(?:\((.*?)\))?$/', $type2, $m2);
         
+        $baseType1 = $m1[1] ?? $type1;
+        $baseType2 = $m2[1] ?? $type2;
+        $params1 = isset($m1[2]) ? explode(',', $m1[2]) : [];
+        $params2 = isset($m2[2]) ? explode(',', $m2[2]) : [];
+
         // Some types are equivalent
         $equivalentTypes = [
             'int' => ['integer', 'int'],
@@ -800,13 +834,40 @@ class FetchDatabaseSchemaCommand extends Command
             'timestamp' => ['timestamp', 'datetime'],
         ];
         
+        // Check if base types are equivalent
+        $typesMatch = false;
         foreach ($equivalentTypes as $group) {
             if (in_array($baseType1, $group) && in_array($baseType2, $group)) {
-                return true;
+                $typesMatch = true;
+                break;
             }
         }
         
-        return $baseType1 === $baseType2;
+        if (!$typesMatch && $baseType1 !== $baseType2) {
+            return false;
+        }
+
+        // For types that need exact parameter matching
+        $exactParamTypes = [
+            'decimal' => true,
+            'varchar' => true,
+            'char' => true
+        ];
+
+        if (isset($exactParamTypes[$baseType1]) || isset($exactParamTypes[$baseType2])) {
+            // Compare parameters if they exist
+            if (count($params1) !== count($params2)) {
+                return false;
+            }
+
+            for ($i = 0; $i < count($params1); $i++) {
+                if ((int)trim($params1[$i]) !== (int)trim($params2[$i])) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -819,12 +880,23 @@ class FetchDatabaseSchemaCommand extends Command
      */
     protected function generateAlterColumnSQL(string $table, array $column, object $existingColumn): string
     {
+        // Her bir değişiklik için ayrı statement oluştur
+        $statements = [];
+
+        // Önce indeksleri kaldır
+        $existingIndexes = $this->getTableIndexes($table);
+        foreach ($existingIndexes as $index) {
+            if ($index->Column_name === $existingColumn->Field && $index->Key_name !== 'PRIMARY') {
+                $statements[] = "ALTER TABLE `{$table}` DROP INDEX `{$index->Key_name}`";
+            }
+        }
+
+        // Kolon değişikliği için SQL oluştur
         $sqlType = $this->mapLaravelTypeToMySQLType($column['type'], $column['params']);
         $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
         
         if (isset($column['modifiers']['default'])) {
             $defaultVal = $column['modifiers']['default'];
-            // Remove quotes if they're already in the default value
             $defaultVal = trim($defaultVal, "'\"");
             if ($defaultVal === 'CURRENT_TIMESTAMP') {
                 $default = "DEFAULT CURRENT_TIMESTAMP";
@@ -836,8 +908,26 @@ class FetchDatabaseSchemaCommand extends Command
         } else {
             $default = '';
         }
+
+        // Kolon değişikliğini ekle
+        $statements[] = "ALTER TABLE `{$table}` MODIFY COLUMN `{$column['name']}` {$sqlType} {$nullable} {$default}";
+
+        // Yeni indeksleri ekle
+        if (isset($column['modifiers']['unique'])) {
+            $statements[] = "ALTER TABLE `{$table}` ADD UNIQUE INDEX `unique_{$column['name']}` (`{$column['name']}`)";
+        } elseif (isset($column['modifiers']['index'])) {
+            $statements[] = "ALTER TABLE `{$table}` ADD INDEX `index_{$column['name']}` (`{$column['name']}`)";
+        }
+
+        // İlk statement'ı dön, diğerleri alterStatements dizisine eklenecek
+        $firstStatement = array_shift($statements);
         
-        return "ALTER TABLE `{$table}` MODIFY COLUMN `{$column['name']}` {$sqlType} {$nullable} {$default}";
+        // Kalan statements'ları ana dizeye ekle
+        if (!empty($statements)) {
+            $this->additionalAlterStatements = array_merge($this->additionalAlterStatements ?? [], $statements);
+        }
+
+        return $firstStatement;
     }
 
     /**
@@ -1016,14 +1106,15 @@ class FetchDatabaseSchemaCommand extends Command
      */
     protected function detectSpecialColumn(string $columnName): bool|string
     {
-        // Timestamp alternatives
-        $timestampAlternatives = [
+        // Special timestamp columns including SoftDeletes
+        $specialColumns = [
             'created_at' => ['created', 'creation_date', 'date_created', 'create_time', 'created_time'],
-            'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified']
+            'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified'],
+            'deleted_at' => ['deleted', 'deletion_date', 'date_deleted', 'delete_time', 'deleted_time']  // Yeni eklendi
         ];
         
-        foreach ($timestampAlternatives as $standard => $alternatives) {
-            if (in_array(strtolower($columnName), $alternatives)) {
+        foreach ($specialColumns as $standard => $alternatives) {
+            if ($columnName === $standard || in_array(strtolower($columnName), $alternatives)) {
                 return $standard;
             }
         }
@@ -1047,7 +1138,13 @@ class FetchDatabaseSchemaCommand extends Command
     protected function generateIndexName(string $type, array $columns): string
     {
         $prefix = $type === 'unique' ? 'unique' : 'index';
-        return $prefix . '_' . implode('_', $columns);
+        
+        // For composite indexes, use all column names
+        if (count($columns) > 1) {
+            return $prefix . '_' . implode('_', $columns);
+        }
+        
+        return $prefix . '_' . $columns[0];
     }
 
     /**
