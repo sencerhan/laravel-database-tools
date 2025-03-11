@@ -1,152 +1,121 @@
 # Laravel DB Tools
 
-Generate, synchronize and manage Laravel migration and seeder files from existing database tables.
+Database schema synchronization tool for Laravel that updates your database structure to match your migration files.
 
 ## Features
 
-### Migration Generator (`migrations:from-database`)
-- Supports all MySQL column types including spatial types
-- Auto-detects relationships and creates foreign keys
-- Handles unique and normal indexes
-- Native PHP 8.1+ enum support with class generation
-- Preserves column comments and default values
-- Special handling for UUID, IP, and MAC address fields
-
-### Seeder Generator (`seeders:from-database`)
-- Creates individual seeder files for each table
-- Updates DatabaseSeeder automatically
-- Preserves data types and handles NULL values
-- Special handling for timestamps and binary data
-- Properly escapes special characters
-
-### Migration Checker (`migrations:check-and-save`)
-- Registers existing tables in migrations table
-- Prevents duplicate table creation attempts
-- Maintains proper migration batch ordering
-- Perfect for legacy database integration
-
 ### Database Synchronizer (`db:fetch`)
 - Updates existing database tables to match migration files
-- Adds missing columns defined in migrations
-- Modifies column properties to match migration definitions
-- Adds or updates indexes from migration files
-- Shows detailed information about detected changes
+- Safe schema modifications with temporary table approach
+- Robust handling of all MySQL column types
+- Special handling for:
+  - Decimal/Float with precision/scale
+  - Enum/Set with value lists
+  - Foreign keys and indexes
+  - Laravel's special columns (timestamps, soft deletes)
+- Progress tracking and detailed logging
+- Data integrity verification
+
+### Supported Column Types
+- **Numeric Types:** integer, bigInteger, decimal, float, double (with unsigned variants)
+- **String Types:** char, varchar, text, mediumText, longText
+- **Date/Time Types:** date, dateTime, timestamp, time (with timezone variants)
+- **Special Types:** enum, set, json, binary
+- **Laravel Types:** softDeletes, rememberToken, timestamps
 
 ## Installation
-
-Add the package to your project using Composer:
 
 ```bash
 composer require sencerhan/laravel-db-tools
 ```
 
-For Laravel 8 and above, the ServiceProvider will be automatically registered.
-
 ## Usage
 
-### 1. Creating Migrations From Database
+### Basic Usage
 
-To create migration files for all tables in the database:
-
-```bash
-php artisan migrations:from-database
-```
-
-To create migration files for specific tables:
-
-```bash
-php artisan migrations:from-database --tables=users,posts,comments
-```
-
-To create migration files excluding specific tables:
-
-```bash
-php artisan migrations:from-database --without_tables=logs,temp_data
-```
-
-### 2. Creating Seeders From Database
-
-To create seeder files for all tables in the database:
-
-```bash
-php artisan seeders:from-database
-```
-
-To create seeder files for specific tables:
-
-```bash
-php artisan seeders:from-database --tables=users,posts,comments
-```
-
-To create seeder files excluding specific tables:
-
-```bash
-php artisan seeders:from-database --without_tables=logs,temp_data
-```
-
-### 3. Checking and Saving Migrations
-
-To check all migration files and save them to the migrations table if tables exist:
-
-```bash
-php artisan migrations:check-and-save
-```
-
-This command will:
-1. Check all migration files in migrations directory
-2. For each migration file, check if the corresponding table exists in database
-3. If table exists and migration is not already in migrations table, save it
-4. Skip migrations that are already in migrations table or whose tables don't exist
-
-### 4. Updating Database Schema to Match Migrations
-
-To update database tables to match your migration files:
-
+To update all tables:
 ```bash
 php artisan db:fetch
 ```
 
-To update specific tables only:
-
+To update specific tables:
 ```bash
 php artisan db:fetch --tables=users,posts
 ```
 
-This command will:
-1. Look at the schema defined in your migration files
-2. Compare it with your current database structure
-3. Generate and execute SQL to make your database match the migrations
-4. Display detailed information about any detected changes
+### Debug Mode
+Show detailed information about changes:
+```bash
+php artisan db:fetch --debug
+```
 
-## Use Cases
+### Force Mode
+Force schema changes even with constraints:
+```bash
+php artisan db:fetch --force
+```
 
-1. **Legacy Database Integration**
-   - Generate migrations from an existing database
-   - Register those migrations to avoid migration conflicts
-   - Use models with your existing tables
+## Key Features
 
-2. **Database Synchronization**
-   - Keep development, staging, and production databases in sync
-   - Update database structures based on migration files without running migrations
-   - Fix inconsistencies between databases and code
+### 1. Safe Schema Updates
+- Uses temporary tables for risky operations
+- Verifies data integrity after changes
+- Automatic rollback on failure
+- Preserves foreign key relationships
 
-3. **Data Migration and Backup**
-   - Generate seeders with your actual production data
-   - Create a code-based backup of your database content
-   - Transfer data between environments systematically
+### 2. Column Handling
+- Precise type mapping between Laravel and MySQL
+- Support for all modifiers (nullable, default, unique, etc.)
+- Special handling for decimal precision/scale
+- Proper enum/set value management
 
-4. **Team Collaboration**
-   - Synchronize database changes made by different team members
-   - Guarantee database consistency across development environments
-   - Generate migrations for ad-hoc database changes
+### 3. Constraint Management
+- Safe foreign key handling
+- Index recreation
+- Smart constraint dependency resolution
+- Automatic backup and restore
 
-## Laravel Version Compatibility
+### 4. Data Protection
+- Preserves data during structure changes
+- Validates data integrity after modifications
+- Protects special Laravel columns
+- Handles NOT NULL constraints safely
 
-This package is compatible with the following Laravel versions:
-- Laravel 8.x
-- Laravel 9.x
-- Laravel 10.x
-- Laravel 11.x
+## Error Handling
+
+The tool provides detailed error messages and:
+- Shows exact SQL causing problems
+- Maintains data integrity during errors
+- Attempts to restore constraints after failures
+- Provides debug information when needed
+
+## Examples
+
+### Enum/Set Columns:
+```php
+// In your migration:
+$table->enum('status', ['active', 'pending', 'cancelled']);
+$table->set('permissions', ['read', 'write', 'delete']);
+```
+
+### Decimal/Float Columns:
+```php
+$table->decimal('amount', 8, 2);
+$table->unsignedDecimal('price', 10, 2);
+$table->float('score', 8, 2);
+```
+
+### Special Modifiers:
+```php
+$table->string('name')->charset('utf8mb4')->collation('utf8mb4_unicode_ci');
+$table->decimal('price', 8, 2)->unsigned();
+$table->enum('level', ['basic', 'premium'])->default('basic')->nullable();
+```
+
+## Requirements
+- Laravel 8.x or higher
+- PHP 8.1 or higher
+- MySQL 5.7 or higher
 
 ## License
 

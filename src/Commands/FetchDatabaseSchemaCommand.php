@@ -7,59 +7,25 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use function database_path;
 
-/**
- * Sync database tables with migration files
- * 
- * Features:
- * - Updates database tables according to migration files
- * - Adds columns defined in migrations to database
- * - Modifies column properties to match migration definitions
- * - Adds or updates indexes from migration files
- * - Ensures database matches migration definitions
- * 
- * Usage:
- * php artisan db:fetch                      # All tables
- * php artisan db:fetch --tables=users,posts # Specific tables
- */
+
 class FetchDatabaseSchemaCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
-    protected $signature = 'db:fetch 
-        {--tables= : Specify tables separated by commas}';
-
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
+    protected $tablesBeingProcessed = [];
+    protected $signature = 'db:fetch {--tables= : Specify tables separated by commas}
+                                 {--debug : Shows debug information}
+                                 {--force : Force schema changes even with constraints}';
     protected $description = 'Update database schema to match migration files';
-
-    /**
-     * Current table being processed
-     * 
-     * @var string|null
-     */
-    protected $currentTable = null;
-    
-    /**
-     * Additional ALTER statements to be executed
-     * 
-     * @var array
-     */
-    protected $additionalAlterStatements = [];
-
-    /**
-     * Execute the console command.
-     *
-     * @return int
-     */
+    private $debug_mode;
     public function handle()
     {
+        $this->output->writeln([
+            '╔═══════════════════════════════════════════════════════════════╗',
+            '║ <fg=bright-blue>Database Schema Synchronizer</> <fg=gray>v1.0</fg>                    ║',
+            '╚═══════════════════════════════════════════════════════════════╝',
+        ]);
+
         $this->info("\nStarting database update process based on migrations...");
 
         try {
@@ -67,7 +33,7 @@ class FetchDatabaseSchemaCommand extends Command
             $specifiedTables = $this->option('tables')
                 ? explode(',', $this->option('tables'))
                 : [];
-
+            $this->debug_mode = $this->option('debug') ? true : false;
             if (!empty($specifiedTables)) {
                 $tables = $specifiedTables;
                 $this->info("Processing specified tables: " . implode(', ', $tables));
@@ -76,11 +42,30 @@ class FetchDatabaseSchemaCommand extends Command
                 $this->info("Processing all tables: " . count($tables) . " tables found.");
             }
 
+            // Store tables for progress tracking
+            $this->tablesBeingProcessed = $tables;
+
             foreach ($tables as $table) {
                 $this->processTable($table);
+                $this->output->writeln("<fg=gray>──────────────────────────────────────────────────────────────</>");
             }
 
-            $this->info("\nDatabase update process completed!");
+            $this->displaySummary([
+                'processed' => count($this->tablesBeingProcessed),
+                'total' => count($this->getAllTables()),
+                'added' => DB::getQueryLog() ? count(array_filter(DB::getQueryLog(), function($query) {
+                    return strpos($query['query'], 'ADD COLUMN') !== false;
+                })) : 0,
+                'modified' => DB::getQueryLog() ? count(array_filter(DB::getQueryLog(), function($query) {
+                    return strpos($query['query'], 'MODIFY COLUMN') !== false;
+                })) : 0,
+                'dropped' => DB::getQueryLog() ? count(array_filter(DB::getQueryLog(), function($query) {
+                    return strpos($query['query'], 'DROP COLUMN') !== false;
+                })) : 0,
+                'errors' => 0,
+                'error_details' => [],
+                'duration' => number_format(microtime(true) - LARAVEL_START, 2)
+            ]);
             return Command::SUCCESS;
         } catch (\Exception $e) {
             $this->error("\nAn error occurred: " . $e->getMessage());
@@ -90,780 +75,944 @@ class FetchDatabaseSchemaCommand extends Command
     }
 
     /**
-     * Get all tables from database
-     *
-     * @return array
-     */
-    protected function getAllTables(): array
-    {
-        // Instead of getting tables from database, get them from migration files
-        $migrationFiles = File::glob(database_path('migrations/*_create_*_table.php'));
-        
-        $tables = [];
-        foreach ($migrationFiles as $file) {
-            preg_match('/\d{4}_\d{2}_\d{2}_\d{6}_create_(.+)_table\.php/', basename($file), $matches);
-            if (!empty($matches[1])) {
-                $tables[] = $matches[1];
-            }
-        }
-        
-        return $tables;
-    }
-
-    /**
      * Process a single table
-     *
-     * @param string $table
-     * @return void
      */
     protected function processTable(string $table): void
     {
-        $this->info("\nProcessing table: {$table}");
-        
-        // Store the current table name
-        $this->currentTable = $table;
-        
-        // Find migration file for table
-        $migrationFile = $this->findMigrationFile($table);
-        
-        if (!$migrationFile) {
-            $this->warn("  No migration file found for table {$table}");
-            return;
-        }
-        
-        $this->info("  Found migration file: " . basename($migrationFile));
-        
-        // Extract migration schema data
-        $migrationSchema = $this->extractMigrationSchema($migrationFile, $table);
-        
-        if (empty($migrationSchema)) {
-            $this->warn("  Could not extract schema from migration file");
-            return;
-        }
-        
-        // Check if table exists in database
-        if (Schema::hasTable($table)) {
-            $this->updateExistingTable($table, $migrationSchema);
-        } else {
-            $this->createTable($table, $migrationSchema);
+        $this->output->writeln([
+            '',
+            " <fg=bright-blue>┌─────────────────────────────────────────┐</>",
+            " <fg=bright-blue>│</> Processing Table: <fg=white;bg=blue> {$table} </> <fg=bright-blue>│</>",
+            " <fg=bright-blue>└─────────────────────────────────────────┘</>",
+        ]);
+
+        try {
+            // Find migration file for table
+            $migrationFile = $this->findMigrationFile($table);
+
+            if (!$migrationFile) {
+                $this->warn("  No migration file found for table {$table}");
+                return;
+            }
+
+            $this->line(" <fg=blue>ℹ</> Found migration file: " . basename($migrationFile));
+
+            // Extract migration schema data
+            $content = File::get($migrationFile);
+            $this->line("  Migration content found, parsing schema...");
+
+            $migrationSchema = $this->parseMigrationStructure($content);
+            if ($this->debug_mode) {
+                $this->line("  Parsed migration structure: " . json_encode($migrationSchema, JSON_PRETTY_PRINT));
+            }
+            if (empty($migrationSchema)) {
+                $this->warn("  Could not extract schema from migration file");
+                return;
+            }
+
+            // Get existing table structure for comparison
+            if (Schema::hasTable($table)) {
+                $existingColumns = DB::select("SHOW FULL COLUMNS FROM `{$table}`");
+                if ($this->debug_mode) {
+                    $this->line("  Current table columns: " . json_encode($existingColumns, JSON_PRETTY_PRINT));
+                }
+
+                // Compare and generate changes
+                $changes = [
+                    'drop_columns' => [],
+                    'add_columns' => [],
+                    'modify_columns' => [],
+                    'drop_indexes' => [],
+                    'add_indexes' => []
+                ];
+
+                // Map existing columns by name
+                $existingColumnsMap = [];
+                foreach ($existingColumns as $col) {
+                    $existingColumnsMap[$col->Field] = $col;
+                }
+
+                // Check for columns to add or modify
+                foreach ($migrationSchema['columns'] as $column) {
+                    if (empty($column['name'])) continue;
+
+                    if (!isset($existingColumnsMap[$column['name']])) {
+                        $this->info("  Column '{$column['name']}' needs to be added");
+                        $changes['add_columns'][] = $column;
+                    } else {
+                        // Compare column properties
+                        $differences = $this->compareColumnDefinitions($column, $existingColumnsMap[$column['name']]);
+                        if (!empty($differences)) {
+                            $this->info("  Column '{$column['name']}' needs modification: " . json_encode($differences));
+                            $column['differences'] = $differences; // Add differences to column
+                            $changes['modify_columns'][] = $column;
+                        }
+                    }
+                }
+
+                // Check for columns to drop
+                foreach ($existingColumnsMap as $columnName => $column) {
+                    if ($this->shouldPreserveColumn($columnName, $migrationSchema['hasTimestamps'])) {
+                        continue; // Skip preserved columns
+                    }
+
+                    $found = false;
+                    foreach ($migrationSchema['columns'] as $migrationColumn) {
+                        if ($migrationColumn['name'] === $columnName) {
+                            $found = true;
+                            break;
+                        }
+                    }
+
+                    if (!$found) {
+                        $this->line(" <fg=yellow>⚠</> Column '{$columnName}' needs to be dropped");
+                        $changes['drop_columns'][] = $columnName;
+                    }
+                }
+
+                // Process the changes
+                if (
+                    !empty($changes['drop_columns']) || !empty($changes['add_columns']) ||
+                    !empty($changes['modify_columns']) || !empty($changes['drop_indexes']) ||
+                    !empty($changes['add_indexes'])
+                ) {
+
+                    $this->info("  Applying changes to table...");
+                    $this->processTableUpdates($table, $changes);
+                } else {
+                    $this->info("  No changes needed for table {$table}");
+                }
+            } else {
+                $this->warn("  Table {$table} does not exist. Use 'php artisan migrate' to create it.");
+            }
+        } catch (\Exception $e) {
+            $this->line(" <fg=red>✗</> Error processing table {$table}: " . $e->getMessage());
+            $this->line("  Stack trace: " . $e->getTraceAsString());
         }
     }
 
     /**
      * Find migration file for table
-     *
-     * @param string $table
-     * @return string|null
      */
     protected function findMigrationFile(string $table): ?string
     {
-        $migrations = File::glob(database_path('migrations/*_create_' . $table . '_table.php'));
-        
-        if (count($migrations) > 0) {
-            return $migrations[0];
+        $patterns = [
+            database_path('migrations/*_create_' . $table . '_table.php'),
+            database_path('migrations/*_' . $table . '.php')
+        ];
+
+        foreach ($patterns as $pattern) {
+            $files = File::glob($pattern);
+            if (!empty($files)) {
+                return $files[0];
+            }
         }
-                
-        // Also search for migrations that might have different naming pattern
-        $migrations = File::glob(database_path('migrations/*_' . $table . '.php'));
-        
-        if (count($migrations) > 0) {
-            return $migrations[0];
-        }
-        
+
         return null;
     }
 
     /**
-     * Extract schema information from migration file
-     *
-     * @param string $migrationFile
-     * @param string $table
-     * @return array
+     * Laravel column types and their MySQL equivalents
      */
-    protected function extractMigrationSchema(string $migrationFile, string $table): array
-    {
-        $content = File::get($migrationFile);
-        
-        // Extract Schema::create block
-        preg_match('/Schema::create\([\'"]' . $table . '[\'"],\s*function\s*\(Blueprint\s*\$table\)\s*{(.*?)}\);/s', $content, $matches);
-        
-        if (empty($matches[1])) {
-            return [];
-        }
-        
-        $schemaBlock = $matches[1];
-        
-        // Parse schema to extract columns and indexes
-        return $this->parseMigrationSchema($schemaBlock);
-    }
+    protected array $columnDefinitions = [
+        'id' => [
+            'type' => 'bigint',
+            'length' => 20,
+            'unsigned' => true,
+            'autoIncrement' => true,
+            'primary' => true,
+            'nullable' => false
+        ],
+        'string' => [
+            'type' => 'varchar',
+            'default_length' => 255,
+            'allows' => ['length', 'nullable', 'default', 'unique', 'index']
+        ],
+        'integer' => [
+            'type' => 'int',
+            'default_length' => 11,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'foreignId' => [
+            'type' => 'bigint',
+            'length' => 20,
+            'unsigned' => true,
+            'nullable' => false,
+            'index' => true
+        ],
+        // Add other types as needed...
+    ];
 
     /**
-     * Parse migration schema block to extract columns and indexes
-     * with improved recognition for timestamps and other conventions
-     *
-     * @param string $schemaBlock
-     * @return array
+     * Column type definitions with their variations and modifiers
      */
-    protected function parseMigrationSchema(string $schemaBlock): array
+    protected array $columnTypes = [
+        // Temel ID ve Primary Key tipleri
+        'id' => [
+            'mysql_type' => 'bigint',
+            'length' => 20,
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary',
+            'nullable' => false
+        ],
+        'increments' => [
+            'mysql_type' => 'int',
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary'
+        ],
+        'tinyIncrements' => [
+            'mysql_type' => 'tinyint',
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary'
+        ],
+        'smallIncrements' => [
+            'mysql_type' => 'smallint',
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary'
+        ],
+        'mediumIncrements' => [
+            'mysql_type' => 'mediumint',
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary'
+        ],
+        'bigIncrements' => [
+            'mysql_type' => 'bigint',
+            'attributes' => ['unsigned', 'auto_increment'],
+            'index' => 'primary'
+        ],
+
+        // String ve Text tipleri
+        'char' => [
+            'mysql_type' => 'char',
+            'default_length' => 255,
+            'allows' => ['length', 'nullable', 'default', 'unique', 'index', 'collation']
+        ],
+        'string' => [
+            'mysql_type' => 'varchar',
+            'default_length' => 255,
+            'allows' => ['length', 'nullable', 'default', 'unique', 'index', 'collation']
+        ],
+        'text' => [
+            'mysql_type' => 'text',
+            'allows' => ['nullable', 'collation']
+        ],
+        'mediumText' => [
+            'mysql_type' => 'mediumtext',
+            'allows' => ['nullable', 'collation']
+        ],
+        'longText' => [
+            'mysql_type' => 'longtext',
+            'allows' => ['nullable', 'collation']
+        ],
+
+        // Sayısal tipler
+        'integer' => [
+            'mysql_type' => 'int',
+            'default_length' => 11,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'tinyInteger' => [
+            'mysql_type' => 'tinyint',
+            'default_length' => 4,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'smallInteger' => [
+            'mysql_type' => 'smallint',
+            'default_length' => 6,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'mediumInteger' => [
+            'mysql_type' => 'mediumint',
+            'default_length' => 9,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'bigInteger' => [
+            'mysql_type' => 'bigint',
+            'default_length' => 20,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+
+        // Decimal ve Float tipleri
+        'decimal' => [
+            'mysql_type' => 'decimal',
+            'default_precision' => 8,
+            'default_scale' => 2,
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'float' => [
+            'mysql_type' => 'float',
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+        'double' => [
+            'mysql_type' => 'double',
+            'allows' => ['unsigned', 'nullable', 'default', 'unique', 'index']
+        ],
+
+        // Boolean
+        'boolean' => [
+            'mysql_type' => 'tinyint',
+            'length' => 1,
+            'allows' => ['nullable', 'default']
+        ],
+
+        // Tarih ve Zaman tipleri
+        'date' => [
+            'mysql_type' => 'date',
+            'allows' => ['nullable', 'default', 'index']
+        ],
+        'dateTime' => [
+            'mysql_type' => 'datetime',
+            'allows' => ['nullable', 'default', 'index', 'precision']
+        ],
+        'dateTimeTz' => [
+            'mysql_type' => 'datetime',
+            'attributes' => ['timezone'],
+            'allows' => ['nullable', 'default', 'index', 'precision']
+        ],
+        'time' => [
+            'mysql_type' => 'time',
+            'allows' => ['nullable', 'default', 'index']
+        ],
+        'timeTz' => [
+            'mysql_type' => 'time',
+            'attributes' => ['timezone'],
+            'allows' => ['nullable', 'default', 'index']
+        ],
+        'timestamp' => [
+            'mysql_type' => 'timestamp',
+            'allows' => ['nullable', 'default', 'index', 'precision']
+        ],
+        'timestampTz' => [
+            'mysql_type' => 'timestamp',
+            'attributes' => ['timezone'],
+            'allows' => ['nullable', 'default', 'index', 'precision']
+        ],
+
+        // JSON ve Binary
+        'binary' => [
+            'mysql_type' => 'blob',
+            'allows' => ['nullable']
+        ],
+        'json' => [
+            'mysql_type' => 'json',
+            'allows' => ['nullable']
+        ],
+        'jsonb' => [
+            'mysql_type' => 'json',
+            'allows' => ['nullable']
+        ],
+
+        // Özel tipler
+        'enum' => [
+            'mysql_type' => 'enum',
+            'requires' => ['values'],
+            'allows' => ['nullable', 'default']
+        ],
+        'set' => [
+            'mysql_type' => 'set',
+            'requires' => ['values'],
+            'allows' => ['nullable', 'default']
+        ],
+
+        // Laravel özel tipleri
+        'rememberToken' => [
+            'mysql_type' => 'varchar',
+            'length' => 100,
+            'nullable' => true
+        ],
+        'softDeletes' => [
+            'mysql_type' => 'timestamp',
+            'name' => 'deleted_at',
+            'nullable' => true
+        ],
+        'foreignId' => [
+            'mysql_type' => 'bigint',
+            'attributes' => ['unsigned'],
+            'creates_index' => true,
+            'allows' => ['nullable', 'default', 'constrained']
+        ]
+    ];
+
+    /**
+     * Column modifiers and their MySQL equivalents
+     */
+    protected array $columnModifiers = [
+        'nullable' => ['sql' => 'NULL', 'default' => 'NOT NULL'],
+        'unsigned' => ['sql' => 'unsigned', 'requires_types' => ['integer', 'bigInteger']],
+        'unique' => ['sql' => 'UNIQUE', 'creates_index' => true],
+        'index' => ['sql' => '', 'creates_index' => true],
+        'default' => ['sql' => 'DEFAULT ?', 'allows_value' => true],
+        'after' => ['sql' => 'AFTER ?', 'allows_value' => true]
+    ];
+
+    /**
+     * Parse migration file structure in a more organized way
+     */
+    protected function parseMigrationStructure(string $content): array
     {
-        $lines = explode("\n", $schemaBlock);
-        $columns = [];
-        $indexes = [];
-        $hasTimestamps = false;
-        
+        $structure = [
+            'columns' => [],
+            'indexes' => [],
+            'foreign_keys' => [],
+            'primary_key' => null,
+            'hasTimestamps' => false
+        ];
+
+        // Extract schema definition block
+        preg_match('/Schema::create.*?{(.*?)}\);/s', $content, $matches);
+        if (empty($matches[1])) return $structure;
+
+        $lines = explode("\n", $matches[1]);
         foreach ($lines as $line) {
             $line = trim($line);
             if (empty($line)) continue;
 
-            // Debug output
-            $this->line("    * Processing line: " . $line);
+            // Handle multi-column unique indexes
+            if (preg_match('/\$table->unique\(\[(.*?)\](?:,\s*[\'"]([^\'"]+)[\'"])?\)/', $line, $matches)) {
+                $columns = array_map(function ($col) {
+                    return trim(trim($col, "'\""), ' ');
+                }, explode(',', $matches[1]));
 
-            // Check for timestamps
-            if (preg_match('/\$table->timestamps\(\)/', $line)) {
-                $hasTimestamps = true;
+                $indexName = $matches[2] ?? $this->generateIndexName('unique', $columns);
+
+                $structure['indexes'][] = [
+                    'type' => 'unique',
+                    'columns' => $columns,
+                    'name' => $indexName,
+                    'original' => $line
+                ];
                 continue;
             }
 
-            // Check for direct index definitions like $table->index(['col1', 'col2'])
-            if (preg_match('/\$table->(?:index|unique)\(\[(.*?)\]\)/', $line, $indexMatch)) {
-                preg_match_all('/[\'"]([^\'"]+)[\'"]/', $indexMatch[1], $columnMatches);
-                if (!empty($columnMatches[1])) {
-                    $indexColumns = $columnMatches[1];
-                    $indexType = strpos($line, '->unique') !== false ? 'unique' : 'index';
-                    $indexes[] = [
-                        'type' => $indexType,
-                        'columns' => $indexColumns,
-                        'name' => $this->generateIndexName($indexType, $indexColumns),
-                        'original' => $line
-                    ];
-                    $this->line("    * Added composite {$indexType} for columns: " . implode(', ', $indexColumns));
-                    continue;
-                }
+            // Check for timestamps first
+            if (strpos($line, '$table->timestamps()') !== false) {
+                $structure['hasTimestamps'] = true;
+                $structure['columns'][] = [
+                    'type' => 'timestamp',
+                    'name' => 'created_at',
+                    'params' => [],
+                    'modifiers' => ['nullable' => true],
+                    'original' => '$table->timestamp("created_at")->nullable()'
+                ];
+                $structure['columns'][] = [
+                    'type' => 'timestamp',
+                    'name' => 'updated_at',
+                    'params' => [],
+                    'modifiers' => ['nullable' => true],
+                    'original' => '$table->timestamp("updated_at")->nullable()'
+                ];
+                continue;
             }
 
-            // Enhanced column pattern matching with support for array parameters
-            if (preg_match('/\$table->([a-zA-Z0-9_]+)\((.*?)\)((?:->.*?)*);/', $line, $matches)) {
-                $type = $matches[1];
-                $params = $matches[2];
-                $modifiers = $matches[3] ?? '';
-
-                // Extract column name and parameters, supporting arrays
-                $name = '';
-                $columnParams = [];
-
-                if (in_array($type, ['foreignId', 'unsignedBigInteger'])) {
-                    $name = trim($params, "'\" ");
-                } else if (strpos($params, '[') !== false) {
-                    // Handle array parameters
-                    preg_match_all('/[\'"]([^\'"]+)[\'"]/', $params, $paramMatches);
-                    if (!empty($paramMatches[1])) {
-                        $columnParams = $paramMatches[1];
-                        $name = array_shift($columnParams); // First element is usually the column name
-                    }
-                } else if (preg_match('/[\'"]([^\'"]+)[\'"]/', $params, $nameMatch)) {
-                    $name = $nameMatch[1];
-                    $paramStr = preg_replace('/[\'"]' . $name . '[\'"](\s*,\s*)?/', '', $params);
-                    if (!empty($paramStr)) {
-                        $columnParams = array_map('trim', explode(',', $paramStr));
-                    }
-                }
-
-                // Handle index modifiers better
-                $hasIndex = preg_match('/->index\(\)/', $modifiers) || 
-                           strpos($modifiers, '->index()') !== false ||
-                           preg_match('/->index\([\'"]?([^\'"]*)[\'"]?\)/', $modifiers);
-
-                if (!empty($name)) {
-                    // Parse modifiers including defaults and indexes
-                    $columnModifiers = $this->parseModifiers($modifiers);
-
-                    // Add column to schema
-                    $columns[] = [
-                        'type' => $type,
-                        'name' => $name,
-                        'params' => $columnParams,
-                        'modifiers' => $columnModifiers,
-                        'original' => $line
-                    ];
-
-                    $this->line("    * Found column: {$name} ({$type})");
-
-                    // Handle indexes from modifiers
-                    if ($hasIndex || isset($columnModifiers['index'])) {
-                        $indexes[] = [
-                            'type' => 'index',
-                            'columns' => [$name],
-                            'name' => $this->generateIndexName('index', [$name]),
-                            'original' => $line
-                        ];
-                        $this->line("    * Added index for column: {$name}");
-                    }
-                    if (isset($columnModifiers['unique']) || strpos($modifiers, '->unique()') !== false) {
-                        $indexes[] = [
-                            'type' => 'unique',
-                            'columns' => [$name],
-                            'name' => $this->generateIndexName('unique', [$name]),
-                            'original' => $line
-                        ];
-                        $this->line("    * Added unique index for column: {$name}");
-                    }
-                }
+            // Parse each line based on type
+            if ($this->isColumnDefinition($line)) {
+                $structure['columns'][] = $this->parseColumnDefinition($line);
+            } elseif ($this->isIndexDefinition($line)) {
+                $structure['indexes'][] = $this->parseIndexDefinition($line);
+            } elseif ($this->isForeignKeyDefinition($line)) {
+                $structure['foreign_keys'][] = $this->parseForeignKeyDefinition($line);
             }
         }
 
-        // Check for SoftDeletes trait usage
-        $hasSoftDeletes = false;
-        if (strpos($schemaBlock, 'SoftDeletes') !== false || 
-            strpos($schemaBlock, '->softDeletes()') !== false) {
-            $hasSoftDeletes = true;
-        }
+        return $structure;
+    }
 
-        // Parse complex index definitions
-        if (preg_match_all('/\$table->index\(\[(.*?)\]\)/', $schemaBlock, $matches)) {
-            foreach ($matches[1] as $indexColumns) {
-                // Parse column names from the array syntax
-                preg_match_all('/[\'"]([^\'"]+)[\'"]/', $indexColumns, $columnMatches);
-                if (!empty($columnMatches[1])) {
-                    $indexColumns = $columnMatches[1];
-                    $indexes[] = [
-                        'type' => 'index',
-                        'columns' => $indexColumns,
-                        'name' => $this->generateIndexName('index', $indexColumns),
-                        'original' => $matches[0][0]
-                    ];
-                    $this->line("    * Added composite index for columns: " . implode(', ', $indexColumns));
-                }
+    /**
+     * Process migration line by line
+     */
+    protected function parseMigrationLine(string $line): ?array
+    {
+        $line = trim($line);
+        if (empty($line)) return null;
+
+        // Özel durumları kontrol et
+        foreach ($this->columnTypes as $type => $definition) {
+            if (preg_match($this->buildPattern($type), $line, $matches)) {
+                return [
+                    'type' => $type,
+                    'name' => $matches['name'] ?? 'id',
+                    'params' => $this->extractParams($matches, $definition),
+                    'modifiers' => $this->extractModifiers($matches['modifiers'] ?? '', $definition['allows'] ?? [])
+                ];
             }
         }
 
+        return null;
+    }
+
+    protected function buildPattern(string $type): string
+    {
+        return '/\$table->' . $type . '\(' .
+            '(?:[\'"]{1}(?<name>[^\'"]*)[\'"]{1})?' .
+            '(?:,\s*(?<params>[^)]*))?'  .
+            '\)' .
+            '(?<modifiers>(?:->[\w]+(?:\([^)]*\))?)*);/';
+    }
+
+    /**
+     * Check dependencies before dropping anything
+     */
+    protected function checkDependencies(string $table, string $column): array
+    {
+        $dependencies = [];
+
+        // Check foreign key constraints
+        $fks = $this->getForeignKeyDependencies($table, $column);
+        if (!empty($fks)) {
+            $dependencies['foreign_keys'] = $fks;
+        }
+
+        // Check indexes
+        $indexes = $this->getIndexDependencies($table, $column);
+        if (!empty($indexes)) {
+            $dependencies['indexes'] = $indexes;
+        }
+
+        return $dependencies;
+    }
+
+    /**
+     * Check for column dependencies before modifications
+     */
+    protected function getColumnDependencies(string $table, string $column): array
+    {
         return [
-            'columns' => $columns,
-            'indexes' => $indexes,
-            'hasTimestamps' => $hasTimestamps,
-            'hasSoftDeletes' => $hasSoftDeletes  // New property
+            'foreign_keys' => $this->getForeignKeyConstraints($table, $column),
+            'indexes' => $this->getColumnIndexes($table, $column),
+            'references' => $this->getColumnReferences($table, $column)
         ];
     }
 
     /**
-     * Parse column modifiers with improved handling
-     *
-     * @param string $modifiersStr
-     * @return array
+     * Get foreign keys that reference this column
      */
-    protected function parseModifiers(string $modifiersStr): array
+    protected function getColumnReferences(string $table, string $column): array
     {
-        $modifiers = [];
-        
-        if (empty($modifiersStr)) {
-            return $modifiers;
-        }
-
-        // Better index detection
-        if (preg_match('/->index\(\)/', $modifiersStr) || 
-            preg_match('/->index\([\'"]?([^\'"]*)[\'"]?\)/', $modifiersStr)) {
-            $modifiers['index'] = true;
-        }
-
-        // Extract all modifiers with their parameters
-        preg_match_all('/->([a-zA-Z]+)\((.*?)\)/', $modifiersStr, $matches, PREG_SET_ORDER);
-        foreach ($matches as $match) {
-            $modifier = $match[1];
-            $value = trim($match[2], "'\"");
-            $modifiers[$modifier] = $value;
-        }
-
-        // Extract flag modifiers (without parameters)
-        $flagModifiers = ['nullable', 'unsigned', 'unique'];
-        foreach ($flagModifiers as $modifier) {
-            if (strpos($modifiersStr, "->{$modifier}()") !== false) {
-                $modifiers[$modifier] = true;
-            }
-        }
-
-        return $modifiers;
+        return DB::select("
+            SELECT 
+                CONSTRAINT_NAME,
+                TABLE_NAME,
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE 
+                TABLE_SCHEMA = ? AND
+                REFERENCED_TABLE_NAME = ? AND
+                REFERENCED_COLUMN_NAME = ?
+        ", [config('database.connections.mysql.database'), $table, $column]);
     }
 
     /**
-     * Update an existing table to match migration schema
-     *
-     * @param string $table
-     * @param array $migrationSchema
-     * @return void
+     * Compare column definitions
      */
-    protected function updateExistingTable(string $table, array $migrationSchema): void
+    protected function compareColumnDefinitions(array $migration, object $existing): array
     {
-        // Get current table columns
-        $existingColumns = $this->getTableColumns($table);
-        $existingColumnsMap = [];
-        foreach ($existingColumns as $column) {
-            $existingColumnsMap[$column->Field] = $column;
-        }
-        
-        // Get current indexes
-        $existingIndexes = $this->getTableIndexes($table);
-        $existingIndexesMap = $this->groupIndexes($existingIndexes);
-        
-        // Get foreign keys to avoid dropping indexes needed for foreign keys
-        $foreignKeys = $this->getTableForeignKeys($table);
-        $foreignKeyIndexes = $this->extractForeignKeyIndexes($foreignKeys);
-        
-        // Generate SQL to modify table
-        $alterStatements = [];
-        $changesDetected = false;
-        
-        // Geçerli migrationda olması gereken tüm sütunların isimlerini topluyoruz
-        $migrationColumnNames = [];
-        foreach ($migrationSchema['columns'] as $column) {
-            if (!empty($column['name'])) {
-                $migrationColumnNames[] = $column['name'];
+        $differences = [];
+
+        // Skip type comparison for columns that are part of unique indexes
+        if (!isset($migration['modifiers']['unique'])) {
+            // Type comparison
+            if (!$this->typesMatch($migration['type'], $existing->Type)) {
+                $differences['type'] = [
+                    'migration' => $migration['type'],
+                    'existing' => $existing->Type,
+                    'message' => "Type mismatch - Migration wants '{$migration['type']}', currently '{$existing->Type}'"
+                ];
             }
         }
-        
-        // Timestamps için created_at ve updated_at ekleyelim
-        // Ayrıca alternatif timestamp isimlerini de kontrol edelim (created, updated, creation_date vs.)
-        if (!empty($migrationSchema['hasTimestamps'])) {
-            // Standart timestamp sütun adları
-            $timestampColumns = ['created_at', 'updated_at'];
-            
-            // Alternatif isimler için eşleştirmeler
-            $timestampAlternatives = [
-                'created_at' => ['created', 'creation_date', 'date_created', 'create_time', 'created_time', 'insert_time', 'inserted_at'],
-                'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified_at', 'last_modified']
+
+        // Nullable comparison
+        $migrationNullable = $migration['modifiers']['nullable'] ?? false;
+        $existingNullable = $existing->Null === 'YES';
+        if ($migrationNullable !== $existingNullable) {
+            $differences['nullable'] = [
+                'migration' => $migrationNullable,
+                'existing' => $existingNullable,
+                'message' => "Nullability mismatch - Migration wants " .
+                    ($migrationNullable ? 'NULL' : 'NOT NULL') .
+                    ", currently " . ($existingNullable ? 'NULL' : 'NOT NULL')
             ];
-            
-            // Her bir timestamp sütunu için kontrol yapıyoruz
-            foreach ($timestampColumns as $timestampColumn) {
-                // Eğer bu sütun varsa listeye ekle
-                $migrationColumnNames[] = $timestampColumn;
-                
-                // Alternatif isimler varsa ve timestamp olmayan bir tabloysa, bunları da ekleyelim
-                foreach ($timestampAlternatives[$timestampColumn] as $alternative) {
-                    if (isset($existingColumnsMap[$alternative]) && 
-                        (str_contains(strtolower($existingColumnsMap[$alternative]->Type), 'timestamp') || 
-                         str_contains(strtolower($existingColumnsMap[$alternative]->Type), 'datetime'))) {
-                        $migrationColumnNames[] = $alternative;
-                        $this->line("    * Found alternative timestamp column: {$alternative} (will keep it)");
-                    }
-                }
-            }
-        }
-        
-        // Migration'daki tüm indeks isimlerini topla
-        $migrationIndexNames = array_map(function($index) {
-            return $index['name'];
-        }, $migrationSchema['indexes']);
-
-        // Ek olarak column modifier'lardan gelen index isimlerini de ekle
-        foreach ($migrationSchema['columns'] as $column) {
-            if (!empty($column['name'])) {
-                if (isset($column['modifiers']['unique'])) {
-                    $migrationIndexNames[] = $this->generateIndexName('unique', [$column['name']]);
-                }
-                if (isset($column['modifiers']['index'])) {
-                    $migrationIndexNames[] = $this->generateIndexName('index', [$column['name']]);
-                }
-            }
         }
 
-        // Track processed indexes to prevent duplicates
-        $processedIndexes = [];
+        // Default value comparison
+        $migrationDefault = $migration['modifiers']['default'] ?? null;
+        $existingDefault = $existing->Default;
+        if ($this->defaultsAreDifferent($migrationDefault, $existingDefault)) {
+            $differences['default'] = [
+                'migration' => $migrationDefault,
+                'existing' => $existingDefault,
+                'message' => "Default value mismatch - Migration wants '" .
+                    ($migrationDefault ?? 'NULL') .
+                    "', currently '" . ($existingDefault ?? 'NULL') . "'"
+            ];
+        }
 
-        // 1. Önce indeksleri kaldır
-        foreach ($existingIndexesMap as $indexName => $existingIndex) {
-            if (!in_array($indexName, $migrationIndexNames) && $indexName !== 'PRIMARY' && !in_array($indexName, $processedIndexes)) {
-                // Foreign key constraint için kullanılan bir index mi kontrol et
-                if (in_array($indexName, $foreignKeyIndexes)) {
-                    // İlgili foreign key constraint'i bul ve kaldır
-                    foreach ($foreignKeys as $fk) {
-                        if ($fk->CONSTRAINT_NAME === $indexName || 
-                            $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign' === $indexName) {
-                            $changesDetected = true;
-                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`";
-                            $this->line("    * Dropping foreign key constraint {$fk->CONSTRAINT_NAME} before removing index");
+        return $differences;
+    }
+
+    protected function processTableUpdates(string $table, array $changes): void
+    {
+        try {
+            // Store foreign keys for reference
+            $originalForeignKeys = $this->getTableForeignKeys($table);
+            $originalReferencingKeys = $this->getReferencingForeignKeys($table);
+
+            // Check if changes are risky (multiple column modifications, etc.)
+            $isRiskyOperation = $this->isRiskyOperation($changes);
+
+            if ($isRiskyOperation) {
+                $this->info("  Using temporary table for safe updates...");
+                $this->performSafeTableUpdate($table, $changes);
+            } else {
+                // Regular update process
+                foreach ($changes['modify_columns'] ?? [] as $column) {
+                    $message = "<fg=yellow>Column '{$column['name']}'</> will be modified:";
+                    $this->line($message);
+
+                    // Show detailed differences
+                    if (isset($column['differences'])) {
+                        foreach ($column['differences'] as $type => $diff) {
+                            if (isset($diff['message'])) {
+                                $this->line("    • {$diff['message']}");
+                            }
                         }
                     }
                 }
-                
-                $changesDetected = true;
-                $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
-                $this->line("    * Dropping index {$indexName} (not in migration)");
-                $processedIndexes[] = $indexName;
-            }
-        }
-        
-        // 2. Sonra kolonları kaldır
-        foreach ($existingColumnsMap as $columnName => $existingColumn) {
-            if (!in_array($columnName, $migrationColumnNames)) {
-                // Ama id sütununu asla silme
-                if ($columnName !== 'id') {
-                    // Foreign key constraint var mı kontrol et
-                    $constraints = $this->getForeignKeyConstraints($table, $columnName);
-                    if (!empty($constraints)) {
-                        foreach ($constraints as $constraint) {
-                            $changesDetected = true;
-                            $alterStatements[] = "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$constraint->CONSTRAINT_NAME}`";
-                            $this->line("    * Dropping foreign key constraint {$constraint->CONSTRAINT_NAME}");
-                        }
+
+                // Ask for confirmation if not in force mode
+                if (!empty($changes['modify_columns'])) {
+                    $this->line("\n<fg=yellow>The above columns will be modified.</>");
+                }
+
+                // Drop foreign keys first
+                $this->dropTableForeignKeys($table);
+
+                // Drop indexes
+                foreach ($changes['drop_indexes'] ?? [] as $index) {
+                    if ($sql = $this->generateDropIndexSQL($table, $index)) {
+                        DB::statement($sql);
                     }
-                    $changesDetected = true;
-                    $alterStatements[] = $this->generateDropColumnSQL($table, $columnName);
-                    $this->line("    * Dropping column {$columnName} (not in migration)");
                 }
-            }
-        }
-        
-        // Process columns from migration
-        foreach ($migrationSchema['columns'] as $column) {
-            if (empty($column['name'])) {
-                continue; // Skip columns without names (like id())
-            }
-            
-            if (isset($existingColumnsMap[$column['name']])) {
-                // Column exists, check if it needs to be modified
-                $existingColumn = $existingColumnsMap[$column['name']];
-                
-                if ($this->columnNeedsUpdate($column, $existingColumn)) {
-                    $changesDetected = true;
-                    $alterStatements[] = $this->generateAlterColumnSQL($table, $column, $existingColumn);
+
+                // Drop columns
+                foreach ($changes['drop_columns'] ?? [] as $column) {
+                    // Check for and potentially drop foreign key constraints
+                    $this->dropForeignKeyConstraintsForColumn($table, $column);
+
+                    // Now proceed with dropping the column
+                    if ($sql = $this->generateDropColumnSQL($table, $column)) {
+                        DB::statement($sql);
+                    }
                 }
-            } else {
-                // Column doesn't exist, add it
-                $changesDetected = true;
-                $alterStatements[] = $this->generateAddColumnSQL($table, $column);
-            }
-        }
-        
-        // Handle timestamps if they are defined in migration - FIX HERE
-        if (!empty($migrationSchema['hasTimestamps'])) {
-            $timestampColumns = ['created_at', 'updated_at'];  // Removed deleted_at
-            foreach ($timestampColumns as $timestampColumn) {
-                if (!isset($existingColumnsMap[$timestampColumn])) {
-                    $changesDetected = true;
-                    $alterStatements[] = "ALTER TABLE `{$table}` ADD COLUMN `{$timestampColumn}` TIMESTAMP NULL";
-                    $this->line("    * Adding timestamp column {$timestampColumn}");
+
+                // Add new columns
+                foreach ($changes['add_columns'] ?? [] as $column) {
+                    if ($sql = $this->generateAddColumnSQL($table, $column)) {
+                        DB::statement($sql);
+                    }
                 }
-            }
-        }
-        
-        // Process indexes from migration
-        foreach ($migrationSchema['indexes'] as $index) {
-            $indexName = $index['name'];
-            
-            if (!isset($existingIndexesMap[$indexName])) {
-                // Index doesn't exist, add it
-                $changesDetected = true;
-                $alterStatements[] = $this->generateAddIndexSQL($table, $index);
-                $this->line("    * Adding missing index {$indexName}");
-            } else {
-                // Index exists, check if it needs to be updated
-                $existingIndex = $existingIndexesMap[$indexName];
-                
-                if ($this->indexNeedsUpdate($index, $existingIndex)) {
-                    $changesDetected = true;
-                    $alterStatements[] = $this->generateDropIndexSQL($table, $indexName);
-                    $alterStatements[] = $this->generateAddIndexSQL($table, $index);
-                    $this->line("    * Updating index {$indexName}");
+
+                // Modify existing columns
+                foreach ($changes['modify_columns'] ?? [] as $column) {
+                    if ($sql = $this->generateAlterColumnSQL($table, $column)) {
+                        DB::statement($sql);
+                    }
                 }
+
+                // Recreate indexes and foreign keys
+                $this->recreateTableIndexesAndForeignKeys($table, $changes);
+
+                $startTime = microtime(true);
+                // ... perform operation ...
+                $endTime = microtime(true);
+                $duration = round($endTime - $startTime, 2);
+                $this->line(" <fg=green>✓</> Table update completed successfully <fg=gray>(in {$duration}s)</>");
             }
-        }
-        
-        // Execute ALTER statements only if changes are detected
-        if ($changesDetected) {
-            if (!empty($alterStatements)) {
-                $this->info("  Executing " . count($alterStatements) . " ALTER statements...");
-                
-                [$success, $completed] = $this->executeBatchStatements($alterStatements);
-                
-                if ($success) {
-                    $this->info("  Table {$table} updated successfully.");
-                } else {
-                    $this->warn("  Table {$table} partially updated ({$completed}/" . count($alterStatements) . " operations completed).");
-                }
+        } catch (\Exception $e) {
+            // Log error and attempt to restore foreign keys if possible
+            $this->error("  Error while processing changes: " . $e->getMessage());
+
+            try {
+                // Attempt to restore foreign keys
+                $this->restoreForeignKeys($table, $originalForeignKeys, $originalReferencingKeys);
+            } catch (\Exception $restoreException) {
+                $this->warn("  Could not restore foreign keys: " . $restoreException->getMessage());
             }
-        } else {
-            $this->info("  Table {$table} already matches migration. No changes needed.");
+
+            throw $e;
         }
     }
 
     /**
-     * Create a new table based on migration schema
-     *
-     * @param string $table
-     * @param array $migrationSchema
-     * @return void
+     * Check if changes are risky and require temporary table
      */
-    protected function createTable(string $table, array $migrationSchema): void
+    protected function isRiskyOperation(array $changes): bool
     {
-        // This functionality is already handled by Laravel migrations
-        $this->warn("  Table {$table} does not exist. Use 'php artisan migrate' to create it.");
-    }
-
-    /**
-     * Check if a column needs to be updated - improved with detailed logging
-     *
-     * @param array $migrationColumn
-     * @param object $existingColumn
-     * @return bool
-     */
-    protected function columnNeedsUpdate(array $migrationColumn, object $existingColumn): bool
-    {
-        // Skip if this is an index definition
-        if ($migrationColumn['type'] === 'index') {
+        // Skip temporary table when using force option for simple column drops
+        if (
+            $this->option('force') &&
+            count($changes['drop_columns'] ?? []) > 0 &&
+            empty($changes['modify_columns']) &&
+            empty($changes['add_columns'])
+        ) {
             return false;
         }
 
-        // Debug output with more detail for decimal types
-        $this->line("    * Checking column {$existingColumn->Field}:");
-        $this->line("      - Migration type: {$migrationColumn['type']}");
-        $this->line("      - Migration params: " . json_encode($migrationColumn['params']));
-        $this->line("      - Current type: {$existingColumn->Type}");
-        
-        // Compare types
-        $migrationColumnType = $this->mapLaravelTypeToMySQLType($migrationColumn['type'], $migrationColumn['params']);
-        $currentColumnType = strtolower($existingColumn->Type);
-        
-        if (!$this->columnTypesMatch($migrationColumnType, $currentColumnType)) {
-            $this->line("      * Type mismatch - Migration: {$migrationColumnType}, Current: {$currentColumnType}");
+        // Multiple column modifications
+        if (count($changes['modify_columns'] ?? []) > 1) {
             return true;
         }
-        
-        // Compare nullable
-        $migrationNullable = isset($migrationColumn['modifiers']['nullable']);
-        $currentNullable = $existingColumn->Null === 'YES';
-        
-        if ($migrationNullable !== $currentNullable) {
-            $this->line("      * Nullable mismatch - Migration: " . ($migrationNullable ? 'YES' : 'NO') . 
-                        ", Current: " . ($currentNullable ? 'YES' : 'NO'));
+
+        // Column modifications with index changes
+        if (
+            !empty($changes['modify_columns']) &&
+            (!empty($changes['drop_indexes']) || !empty($changes['add_indexes']))
+        ) {
             return true;
         }
-        
-        // Compare default value
-        $migrationDefault = $migrationColumn['modifiers']['default'] ?? null;
-        $currentDefault = $existingColumn->Default;
-        
-        if ($this->defaultsAreDifferent($migrationDefault, $currentDefault)) {
-            $this->line("      * Default value mismatch - Migration: " . 
-                        (is_null($migrationDefault) ? 'NULL' : $migrationDefault) . 
-                        ", Current: " . (is_null($currentDefault) ? 'NULL' : $currentDefault));
-            return true;
+
+        // Data type changes that might cause data loss
+        foreach ($changes['modify_columns'] ?? [] as $column) {
+            if (isset($column['differences']['type'])) {
+                return true;
+            }
         }
 
         return false;
     }
-    
-    /**
-     * Compare default values with special handling
-     *
-     * @param mixed $default1
-     * @param mixed $default2
-     * @return bool
-     */
-    protected function defaultsAreDifferent($default1, $default2): bool
-    {
-        // If both are null or empty, they're the same
-        if (($default1 === null || $default1 === '') && ($default2 === null || $default2 === '')) {
-            return false;
-        }
-        
-        // If one is null but other isn't
-        if (($default1 === null && $default2 !== null) || ($default1 !== null && $default2 === null)) {
-            return true;
-        }
-        
-        // Handle quoted values
-        $default1 = trim($default1, "'\"");
-        $default2 = trim($default2, "'\"");
-        
-        // CURRENT_TIMESTAMP special case
-        if (($default1 === 'CURRENT_TIMESTAMP' || $default1 === 'now()') && 
-            ($default2 === 'CURRENT_TIMESTAMP' || $default2 === 'now()')) {
-            return false;
-        }
-        
-        // Compare as strings
-        return (string)$default1 !== (string)$default2;
-    }
 
     /**
-     * Map Laravel column type to MySQL type with better precision
-     *
-     * @param string $laravelType
-     * @param array $params
-     * @return string
+     * Perform safe table update using temporary table
      */
-    protected function mapLaravelTypeToMySQLType(string $laravelType, array $params): string
+    protected function performSafeTableUpdate(string $table, array $changes): void
     {
-        switch ($laravelType) {
-            case 'id':
-                return 'bigint(20) unsigned';
-                
-            case 'foreignId':
-                return 'bigint(20) unsigned';
-                
-            case 'string':
-                $length = !empty($params[0]) ? (int)$params[0] : 255;
-                return "varchar({$length})";
-                
-            case 'char':
-                $length = !empty($params[0]) ? (int)$params[0] : 255;
-                return "char({$length})";
-                
-            case 'integer':
-                return 'int(11)';
-                
-            case 'bigInteger':
-                return 'bigint(20)';
-                
-            case 'tinyInteger':
-                return 'tinyint(4)';
-                
-            case 'smallInteger':
-                return 'smallint(6)';
-                
-            case 'mediumInteger':
-                return 'mediumint(9)';
-                
-            case 'unsignedInteger':
-                return 'int(10) unsigned';
-                
-            case 'unsignedBigInteger':
-                return 'bigint(20) unsigned';
-                
-            case 'unsignedTinyInteger':
-                return 'tinyint(3) unsigned';
-                
-            case 'unsignedSmallInteger':
-                return 'smallint(5) unsigned';
-                
-            case 'unsignedMediumInteger':
-                return 'mediumint(8) unsigned';
-                
-            case 'decimal':
-                // Ensure proper parameter handling
-                $precision = $scale = 0;
-                if (!empty($params)) {
-                    $precision = (int)trim($params[0] ?? '8');
-                    $scale = (int)trim($params[1] ?? '2');
+        $tempTable = $table . '_temp_' . time();
+        $backupTable = $table . '_backup_' . time();
+
+        try {
+            // First drop all foreign key constraints referencing this table
+            $referencingKeys = $this->getReferencingForeignKeys($table);
+            $this->info("  Dropping foreign key constraints that reference '{$table}'...");
+            foreach ($referencingKeys as $fk) {
+                if ($this->checkConstraintExists($fk->TABLE_NAME, $fk->CONSTRAINT_NAME)) {
+                    $this->info("    - Dropping {$fk->CONSTRAINT_NAME} from {$fk->TABLE_NAME}");
+                    DB::statement("ALTER TABLE `{$fk->TABLE_NAME}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`");
                 }
-                return "decimal({$precision},{$scale})";
-                
-            case 'float':
-                return 'float';
-                
-            case 'double':
-                return 'double';
-                
-            case 'boolean':
-                return 'tinyint(1)';
-                
-            case 'date':
-                return 'date';
-                
-            case 'datetime':
-                return 'datetime';
-                
-            case 'time':
-                return 'time';
-                
-            case 'timestamp':
-                return 'timestamp';
-                
-            case 'text':
-                return 'text';
-                
-            case 'mediumText':
-                return 'mediumtext';
-                
-            case 'longText':
-                return 'longtext';
-                
-            case 'json':
-                return 'json';
-                
-            case 'enum':
-                // For enum types, use the actual values if available
-                if (!empty($params)) {
-                    $values = implode("','", array_map(function($val) {
-                        return trim($val, "'\"");
-                    }, $params));
-                    return "enum('{$values}')";
+            }
+
+            // Create temporary table
+            DB::statement("CREATE TABLE `{$tempTable}` LIKE `{$table}`");
+
+            // Apply structure changes to temporary table
+            $this->applyChangesToTable($tempTable, $changes);
+
+            // Copy data
+            $this->copyTableData($table, $tempTable);
+
+            // Rename tables
+            DB::statement("RENAME TABLE `{$table}` TO `{$backupTable}`, `{$tempTable}` TO `{$table}`");
+
+            // Verify data integrity
+            if ($this->verifyDataIntegrity($table, $backupTable) || $this->option('force')) {
+                // Drop backup
+                $this->info("  Dropping backup table...");
+                DB::statement("DROP TABLE IF EXISTS `{$backupTable}`");
+                $this->line(" <fg=green>✓</> Table update completed successfully.");
+
+                // Restore foreign keys to point to the new table
+                $this->info("  Restoring foreign key references...");
+                foreach ($referencingKeys as $fk) {
+                    // Skip if the referenced column was dropped
+                    if (in_array($fk->REFERENCED_COLUMN_NAME, $changes['drop_columns'] ?? [])) {
+                        $this->warn("    - Skipping foreign key {$fk->CONSTRAINT_NAME} because referenced column {$fk->REFERENCED_COLUMN_NAME} was dropped");
+                        continue;
+                    }
+
+                    try {
+                        // Check if referenced column still exists in the new table
+                        $columnExists = DB::select("SHOW COLUMNS FROM `{$table}` LIKE ?", [$fk->REFERENCED_COLUMN_NAME]);
+                        if (!empty($columnExists)) {
+                            $sql = sprintf(
+                                "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
+                                $fk->TABLE_NAME,
+                                $fk->CONSTRAINT_NAME,
+                                $fk->COLUMN_NAME,
+                                $table,
+                                $fk->REFERENCED_COLUMN_NAME
+                            );
+                            DB::statement($sql);
+                            $this->info("    - Restored foreign key {$fk->CONSTRAINT_NAME} on {$fk->TABLE_NAME}");
+                        }
+                    } catch (\Exception $e) {
+                        $this->warn("    - Could not restore foreign key {$fk->CONSTRAINT_NAME}: " . $e->getMessage());
+                        if (!$this->option('force')) {
+                            throw $e;
+                        }
+                    }
                 }
-                return "varchar(191)";
-                
-            case 'uuid':
-                return 'char(36)';
-                
-            case 'ipAddress':
-                return 'varchar(45)';
-                
-            case 'macAddress':
-                return 'varchar(17)';
-                
-            default:
-                return $laravelType;
+            } else {
+                // Rollback if verification fails and not in force mode
+                $this->warn("  Data integrity check failed. Rolling back...");
+                DB::statement("DROP TABLE `{$table}`");
+                DB::statement("RENAME TABLE `{$backupTable}` TO `{$table}`");
+                throw new \Exception("Data integrity check failed");
+            }
+        } catch (\Exception $e) {
+            // Cleanup on failure
+            if ($this->tableExists($tempTable)) {
+                DB::statement("DROP TABLE IF EXISTS `{$tempTable}`");
+            }
+            throw $e;
         }
     }
 
     /**
-     * Check if column types match
-     *
-     * @param string $type1
-     * @param string $type2
-     * @return bool
+     * Copy data between tables with progress indication
      */
-    protected function columnTypesMatch(string $type1, string $type2): bool
+    protected function copyTableData(string $sourceTable, string $targetTable): void
     {
-        // Normalize types for comparison
-        $type1 = strtolower($type1);
-        $type2 = strtolower($type2);
-        
-        // Extract type and length/precision information
-        preg_match('/^([a-z]+)(?:\((.*?)\))?$/', $type1, $m1);
-        preg_match('/^([a-z]+)(?:\((.*?)\))?$/', $type2, $m2);
-        
-        $baseType1 = $m1[1] ?? $type1;
-        $baseType2 = $m2[1] ?? $type2;
-        $params1 = isset($m1[2]) ? explode(',', $m1[2]) : [];
-        $params2 = isset($m2[2]) ? explode(',', $m2[2]) : [];
+        // Get columns that exist in both tables
+        $sourceColumns = DB::getSchemaBuilder()->getColumnListing($sourceTable);
+        $targetColumns = DB::getSchemaBuilder()->getColumnListing($targetTable);
+        $commonColumns = array_values(array_intersect($sourceColumns, $targetColumns));
 
-        // Some types are equivalent
-        $equivalentTypes = [
-            'int' => ['integer', 'int'],
-            'varchar' => ['varchar', 'string', 'char'],
-            'tinyint' => ['tinyint', 'tinyinteger', 'boolean'],
-            'timestamp' => ['timestamp', 'datetime'],
-        ];
-        
-        // Check if base types are equivalent
-        $typesMatch = false;
-        foreach ($equivalentTypes as $group) {
-            if (in_array($baseType1, $group) && in_array($baseType2, $group)) {
-                $typesMatch = true;
-                break;
+        if (empty($commonColumns)) {
+            throw new \Exception("No common columns found between source and target tables");
+        }
+
+        // Get NOT NULL constraints info from target table
+        $targetColumnInfo = DB::select("SHOW FULL COLUMNS FROM `{$targetTable}`");
+        $notNullColumns = [];
+        foreach ($targetColumnInfo as $column) {
+            if ($column->Null === 'NO' && $column->Default === null) {
+                $notNullColumns[$column->Field] = true;
             }
         }
-        
-        if (!$typesMatch && $baseType1 !== $baseType2) {
-            return false;
+
+        // Build the column list with COALESCE for NOT NULL columns
+        $selectColumns = [];
+        foreach ($commonColumns as $column) {
+            if (isset($notNullColumns[$column])) {
+                // For NOT NULL columns without default, provide a default value based on column type
+                $columnType = $this->getColumnType($targetTable, $column);
+                $defaultValue = $this->getDefaultValueForType($columnType);
+                $selectColumns[] = "COALESCE(`{$column}`, {$defaultValue}) AS `{$column}`";
+            } else {
+                $selectColumns[] = "`{$column}`";
+            }
         }
 
-        // For types that need exact parameter matching
-        $exactParamTypes = [
-            'decimal' => true,
-            'varchar' => true,
-            'char' => true
-        ];
+        $selectColumnList = implode(', ', $selectColumns);
+        $insertColumnList = '`' . implode('`, `', $commonColumns) . '`';
 
-        if (isset($exactParamTypes[$baseType1]) || isset($exactParamTypes[$baseType2])) {
-            // Compare parameters if they exist
-            if (count($params1) !== count($params2)) {
+        $count = DB::table($sourceTable)->count();
+        $batchSize = 1000;
+
+        // Get table progress information
+        $currentTableIndex = array_search($sourceTable, $this->tablesBeingProcessed ?? []) !== false ?
+            array_search($sourceTable, $this->tablesBeingProcessed) + 1 : 0;
+        $totalTables = count($this->tablesBeingProcessed ?? []);
+
+        $tableProgress = $totalTables > 0 ? " [Table {$currentTableIndex}/{$totalTables}]" : "";
+        $this->info("  Copying {$count} rows from {$sourceTable}{$tableProgress}...");
+        $progress = $this->output->createProgressBar($count);
+
+        for ($offset = 0; $offset < $count; $offset += $batchSize) {
+            // Only select columns that exist in both tables
+            DB::statement("INSERT INTO `{$targetTable}` ({$insertColumnList}) 
+                          SELECT {$selectColumnList} FROM `{$sourceTable}` 
+                          LIMIT {$offset}, {$batchSize}");
+
+            $processed = min($offset + $batchSize, $count);
+            $progress->advance(min($batchSize, $count - $offset));
+        }
+
+        $progress->finish();
+        $this->info("\n  Data copy completed.");
+    }
+
+    /**
+     * Get column type information from database
+     */
+    protected function getColumnType(string $table, string $column): string
+    {
+        $result = DB::select("SHOW COLUMNS FROM `{$table}` WHERE Field = ?", [$column]);
+        return $result[0]->Type ?? 'varchar';
+    }
+
+    /**
+     * Get default value for a column type
+     */
+    protected function getDefaultValueForType(string $type): string
+    {
+        // Extract base type without length/precision
+        $baseType = preg_replace('/\(.*\)/', '', strtolower($type));
+
+        // Handle different types
+        if (in_array($baseType, ['int', 'bigint', 'tinyint', 'smallint', 'mediumint'])) {
+            return '0';
+        }
+
+        if (in_array($baseType, ['decimal', 'float', 'double'])) {
+            return '0.0';
+        }
+
+        if (in_array($baseType, ['datetime', 'timestamp'])) {
+            return "CURRENT_TIMESTAMP()";
+        }
+
+        if ($baseType === 'date') {
+            return "CURRENT_DATE()";
+        }
+
+        if ($baseType === 'time') {
+            return "CURRENT_TIME()";
+        }
+
+        if ($baseType === 'boolean' || $baseType === 'bool') {
+            return '0';
+        }
+
+        // Default for strings and other types
+        return "''";
+    }
+
+    /**
+     * Verify data integrity between two tables
+     */
+    protected function verifyDataIntegrity(string $newTable, string $oldTable): bool
+    {
+        // Compare row counts first - they should be the same
+        $newCount = DB::table($newTable)->count();
+        $oldCount = DB::table($oldTable)->count();
+
+        if ($newCount !== $oldCount) {
+            $this->error("  Row count mismatch: {$newTable}={$newCount}, {$oldTable}={$oldCount}");
+            if ($this->option('force')) {
+                $this->warn("  Ignoring row count mismatch due to --force option");
+            } else {
                 return false;
             }
+        }
 
-            for ($i = 0; $i < count($params1); $i++) {
-                if ((int)trim($params1[$i]) !== (int)trim($params2[$i])) {
+        // When in force mode, skip detailed integrity checks
+        if ($this->option('force')) {
+            return true;
+        }
+
+        // Compare checksums for key columns
+        $columns = $this->getKeyColumns($newTable);
+        foreach ($columns as $column) {
+            try {
+                $newChecksum = DB::select("CHECKSUM TABLE `{$newTable}`")[0]->Checksum;
+                $oldChecksum = DB::select("CHECKSUM TABLE `{$oldTable}`")[0]->Checksum;
+
+                if ($newChecksum !== $oldChecksum) {
+                    $this->error("  Checksum mismatch for column {$column}");
                     return false;
                 }
+            } catch (\Exception $e) {
+                $this->warn("  Could not verify checksum: " . $e->getMessage());
+                // Continue with other checks instead of failing immediately
             }
         }
 
@@ -871,395 +1020,1419 @@ class FetchDatabaseSchemaCommand extends Command
     }
 
     /**
-     * Generate SQL to alter an existing column with better data type handling
-     *
-     * @param string $table
-     * @param array $column
-     * @param object $existingColumn
-     * @return string
+     * Get key columns for a table
      */
-    protected function generateAlterColumnSQL(string $table, array $column, object $existingColumn): string
+    protected function getKeyColumns(string $table): array
     {
-        // Her bir değişiklik için ayrı statement oluştur
-        $statements = [];
+        $columns = [];
 
-        // Önce indeksleri kaldır
-        $existingIndexes = $this->getTableIndexes($table);
-        foreach ($existingIndexes as $index) {
-            if ($index->Column_name === $existingColumn->Field && $index->Key_name !== 'PRIMARY') {
-                $statements[] = "ALTER TABLE `{$table}` DROP INDEX `{$index->Key_name}`";
+        // Get primary key
+        $primaryKey = DB::select("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'");
+        if (!empty($primaryKey)) {
+            $columns[] = $primaryKey[0]->Column_name;
+        }
+
+        // Get unique keys
+        $uniqueKeys = DB::select("SHOW KEYS FROM `{$table}` WHERE Non_unique = 0");
+        foreach ($uniqueKeys as $key) {
+            if (!in_array($key->Column_name, $columns)) {
+                $columns[] = $key->Column_name;
             }
         }
 
-        // Kolon değişikliği için SQL oluştur
-        $sqlType = $this->mapLaravelTypeToMySQLType($column['type'], $column['params']);
-        $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
-        
-        if (isset($column['modifiers']['default'])) {
-            $defaultVal = $column['modifiers']['default'];
-            $defaultVal = trim($defaultVal, "'\"");
-            if ($defaultVal === 'CURRENT_TIMESTAMP') {
-                $default = "DEFAULT CURRENT_TIMESTAMP";
-            } else if (is_numeric($defaultVal) && !str_starts_with($defaultVal, "'") && !str_starts_with($defaultVal, '"')) {
-                $default = "DEFAULT {$defaultVal}";
-            } else {
-                $default = "DEFAULT '{$defaultVal}'";
-            }
-        } else {
-            $default = '';
-        }
-
-        // Kolon değişikliğini ekle
-        $statements[] = "ALTER TABLE `{$table}` MODIFY COLUMN `{$column['name']}` {$sqlType} {$nullable} {$default}";
-
-        // Yeni indeksleri ekle
-        if (isset($column['modifiers']['unique'])) {
-            $statements[] = "ALTER TABLE `{$table}` ADD UNIQUE INDEX `unique_{$column['name']}` (`{$column['name']}`)";
-        } elseif (isset($column['modifiers']['index'])) {
-            $statements[] = "ALTER TABLE `{$table}` ADD INDEX `index_{$column['name']}` (`{$column['name']}`)";
-        }
-
-        // İlk statement'ı dön, diğerleri alterStatements dizisine eklenecek
-        $firstStatement = array_shift($statements);
-        
-        // Kalan statements'ları ana dizeye ekle
-        if (!empty($statements)) {
-            $this->additionalAlterStatements = array_merge($this->additionalAlterStatements ?? [], $statements);
-        }
-
-        return $firstStatement;
+        return $columns;
     }
 
     /**
-     * Generate SQL to add a new column with better type support
-     *
-     * @param string $table
-     * @param array $column
-     * @return string
+     * Check if table exists
      */
-    protected function generateAddColumnSQL(string $table, array $column): string
+    protected function tableExists(string $table): bool
     {
-        $sqlType = $this->mapLaravelTypeToMySQLType($column['type'], $column['params']);
-        $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
-        
-        if (isset($column['modifiers']['default'])) {
-            $defaultVal = $column['modifiers']['default'];
-            // Remove quotes if they're already in the default value
-            $defaultVal = trim($defaultVal, "'\"");
-            if ($defaultVal === 'CURRENT_TIMESTAMP') {
-                $default = "DEFAULT CURRENT_TIMESTAMP";
-            } else if (is_numeric($defaultVal) && !str_starts_with($defaultVal, "'") && !str_starts_with($defaultVal, '"')) {
-                $default = "DEFAULT {$defaultVal}";
-            } else {
-                $default = "DEFAULT '{$defaultVal}'";
-            }
-        } else {
-            $default = '';
-        }
-        
-        // Special handling for enum type
-        if ($column['type'] === 'enum') {
-            // Since we cannot easily extract enum values here, we'll use a more generic approach
-            $this->warn("  - Adding enum column {$column['name']} with generic type. You may need to adjust it manually.");
-            $sqlType = "VARCHAR(255)";
-        }
-        
-        // Check for after clause to position the column correctly
-        $after = '';
-        if (isset($column['after'])) {
-            $after = " AFTER `{$column['after']}`";
-        }
-        
-        return "ALTER TABLE `{$table}` ADD COLUMN `{$column['name']}` {$sqlType} {$nullable} {$default}{$after}";
+        return Schema::hasTable($table);
     }
+
+    /**
+     * Attempt to restore foreign keys after a failure
+     */
+    protected function restoreForeignKeys(string $table, array $originalKeys, array $referencingKeys): void
+    {
+        try {
+            foreach ($originalKeys as $fk) {
+                $sql = sprintf(
+                    "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
+                    $table,
+                    $fk->CONSTRAINT_NAME,
+                    $fk->COLUMN_NAME,
+                    $fk->REFERENCED_TABLE_NAME,
+                    $fk->REFERENCED_COLUMN_NAME
+                );
+                DB::statement($sql);
+                $this->line("    * Restored foreign key {$fk->CONSTRAINT_NAME}");
+            }
+
+            foreach ($referencingKeys as $fk) {
+                $sql = sprintf(
+                    "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
+                    $fk->TABLE_NAME,
+                    $fk->CONSTRAINT_NAME,
+                    $fk->COLUMN_NAME,
+                    $table,
+                    $fk->REFERENCED_COLUMN_NAME
+                );
+                DB::statement($sql);
+                $this->line("    * Restored foreign key {$fk->CONSTRAINT_NAME} on {$fk->TABLE_NAME}");
+            }
+        } catch (\Exception $e) {
+            $this->warn("    ! Could not restore all foreign keys: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Check if line contains a column definition
+     */
+    protected function isColumnDefinition(string $line): bool
+    {
+        return preg_match('/\$table->([a-zA-Z]+)\(.*?\)/', $line) === 1;
+    }
+
+    /**
+     * Check if line contains an index definition
+     */
+    protected function isIndexDefinition(string $line): bool
+    {
+        $patterns = [
+            '/\$table->index\(/',
+            '/\$table->unique\(/',
+            '/\$table->primary\(/',
+            '/->index\(\)/',
+            '/->unique\(\)/'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $line)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if line contains a foreign key definition
+     */
+    protected function isForeignKeyDefinition(string $line): bool
+    {
+        $patterns = [
+            '/\$table->foreign\(/',
+            '/->references\(/',
+            '/->on\(/',
+            '/->foreignId\(.*?\)->constrained\(/'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $line)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Parse a column definition line
+     */
+    protected function parseColumnDefinition(string $line): array
+    {
+        $definition = [];
+
+        // Handle special cases first
+        if ($line === '$table->id();') {
+            return [
+                'type' => 'id',
+                'name' => 'id',
+                'params' => [],
+                'modifiers' => ['unsigned' => true, 'autoIncrement' => true]
+            ];
+        }
+
+        // Parse regular column definition
+        if (preg_match('/\$table->([a-zA-Z]+)\((.*?)\)((?:->.*?)*);/', $line, $matches)) {
+            $type = $matches[1];
+            $params = $this->parseParameters($matches[2]);
+            $modifiers = $this->parseModifiers($matches[3] ?? '');
+
+            // Special handling for string type
+            if ($type === 'string') {
+                // Extract base parameters
+                $name = $params[0] ?? null;
+                $length = isset($params[1]) && is_numeric($params[1]) ? (int)$params[1] : 255;
+
+                // Extract string-specific modifiers
+                $charset = null;
+                $collation = null;
+                if (preg_match('/->charset\([\'"]([^\'"]+)[\'"]\)/', $matches[3] ?? '', $charsetMatch)) {
+                    $charset = $charsetMatch[1];
+                }
+                if (preg_match('/->collation\([\'"]([^\'"]+)[\'"]\)/', $matches[3] ?? '', $collationMatch)) {
+                    $collation = $collationMatch[1];
+                }
+
+                // Handle method chaining order variations
+                $isNullable = strpos($matches[3] ?? '', '->nullable()') !== false;
+                $isUnique = strpos($matches[3] ?? '', '->unique()') !== false;
+                $hasIndex = strpos($matches[3] ?? '', '->index()') !== false;
+
+                // Extract default value if exists
+                $default = null;
+                if (preg_match('/->default\((.*?)\)/', $matches[3] ?? '', $defaultMatch)) {
+                    $default = trim($defaultMatch[1], "'\"");
+                }
+
+                // Extract comment if exists
+                $comment = null;
+                if (preg_match('/->comment\([\'"]([^\'"]+)[\'"]\)/', $matches[3] ?? '', $commentMatch)) {
+                    $comment = $commentMatch[1];
+                }
+
+                // Extract after clause if exists
+                $after = null;
+                if (preg_match('/->after\([\'"]([^\'"]+)[\'"]\)/', $matches[3] ?? '', $afterMatch)) {
+                    $after = $afterMatch[1];
+                }
+
+                return [
+                    'type' => 'string',
+                    'name' => $name,
+                    'length' => $length,
+                    'charset' => $charset,
+                    'collation' => $collation,
+                    'modifiers' => array_merge($modifiers, [
+                        'nullable' => $isNullable,
+                        'unique' => $isUnique,
+                        'index' => $hasIndex,
+                        'default' => $default,
+                        'comment' => $comment,
+                        'after' => $after
+                    ]),
+                    'original' => $line
+                ];
+            }
+
+            // Special handling for decimal and float types
+            if (in_array($type, ['decimal', 'float', 'double', 'unsignedDecimal'])) {
+                $precision = $params[1] ?? ($type === 'decimal' ? 8 : null);
+                $scale = $params[2] ?? ($type === 'decimal' ? 2 : null);
+
+                return [
+                    'type' => $type,
+                    'name' => $params[0],
+                    'precision' => $precision,
+                    'scale' => $scale,
+                    'modifiers' => array_merge($modifiers, [
+                        'unsigned' => strpos($type, 'unsigned') === 0,
+                        'precision' => $precision,
+                        'scale' => $scale
+                    ]),
+                    'original' => $line
+                ];
+            }
+
+            // Special handling for enum and set types
+            if (in_array($type, ['enum', 'set'])) {
+                $name = $params[0] ?? null;
+                // Extract values from array parameter
+                $values = [];
+                if (preg_match('/\[(.*?)\]/', $matches[2], $valueMatches)) {
+                    $values = array_map(function ($val) {
+                        return trim(trim($val, "'\""), ' ');
+                    }, explode(',', $valueMatches[1]));
+                }
+
+                return [
+                    'type' => $type,
+                    'name' => $name,
+                    'values' => $values,
+                    'modifiers' => array_merge($modifiers, [
+                        'nullable' => strpos($matches[3] ?? '', '->nullable()') !== false,
+                        'default' => $this->extractDefaultValue($matches[3] ?? '')
+                    ]),
+                    'original' => $line
+                ];
+            }
+
+            // Extract length from parameters if available
+            $length = $params[1] ?? null;
+
+            $definition = [
+                'type' => $type,
+                'name' => $params[0] ?? null,
+                'length' => $length,        // Add length support
+                'params' => array_slice($params, $length ? 2 : 1),
+                'modifiers' => $modifiers,
+                'charset' => null,          // Add charset support
+                'collation' => null,        // Add collation support
+                'original' => $line
+            ];
+
+            return $definition;
+        }
+
+        return $definition;
+    }
+
+    /**
+     * Parse an index definition line
+     */
+    protected function parseIndexDefinition(string $line): array
+    {
+        $definition = [];
+
+        // 1. Temel index tanımları
+        $indexPatterns = [
+            // $table->index(['user_id']);
+            '/\$table->index\(\[(.*?)\]\)/' => function ($matches) {
+                return [
+                    'type' => 'index',
+                    'columns' => $this->parseColumns($matches[1]),
+                    'name' => null
+                ];
+            },
+
+            // $table->index('user_id');
+            '/\$table->index\([\'"]([^\'"]+)[\'"]\)/' => function ($matches) {
+                return [
+                    'type' => 'index',
+                    'columns' => [$matches[1]],
+                    'name' => null
+                ];
+            },
+
+            // $table->index(['user_id'], 'custom_name');
+            '/\$table->index\(\[(.*?)\],\s*[\'"]([^\'"]+)[\'"]\)/' => function ($matches) {
+                return [
+                    'type' => 'index',
+                    'columns' => $this->parseColumns($matches[1]),
+                    'name' => null
+                ];
+            },
+
+            // Method chaining: ->index()
+            '/->index\(\)/' => function ($matches, $context) {
+                if (preg_match('/\$table->([a-zA-Z]+)\([\'"]([^\'"]+)[\'"]/', $context, $colMatch)) {
+                    return [
+                        'type' => 'index',
+                        'columns' => [$colMatch[2]],
+                        'name' => null
+                    ];
+                }
+                return null;
+            },
+
+            // Spatial index
+            '/\$table->spatialIndex\([\'"]([^\'"]+)[\'"]\)/' => function ($matches) {
+                return [
+                    'type' => 'spatial',
+                    'columns' => [$matches[1]],
+                    'name' => null
+                ];
+            },
+
+            // Hash algorithm specified
+            '/\$table->index\(\[(.*?)\],\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\)/' => function ($matches) {
+                return [
+                    'type' => 'index',
+                    'columns' => $this->parseColumns($matches[1]),
+                    'name' => $matches[2],
+                    'algorithm' => $matches[3]
+                ];
+            }
+        ];
+
+        // Try each pattern
+        foreach ($indexPatterns as $pattern => $handler) {
+            if (preg_match($pattern, $line, $matches)) {
+                $result = $handler($matches, $line);
+                if ($result) {
+                    $definition = array_merge($result, [
+                        'original' => $line
+                    ]);
+
+                    // Generate name if not provided
+                    if (empty($definition['name'])) {
+                        $definition['name'] = $this->generateIndexName(
+                            $definition['type'],
+                            $definition['columns']
+                        );
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return $definition;
+    }
+
+    protected function parseColumns(string $columnsStr): array
+    {
+        $columns = [];
+        preg_match_all('/[\'"]([^\'"]+)[\'"]/', $columnsStr, $matches);
+        if (!empty($matches[1])) {
+            $columns = array_map('trim', $matches[1]);
+        }
+        return $columns;
+    }
+
+    protected function generateIndexName(string $type, array $columns): string
+    {
+        // Use the table name from the columns or a default value
+        $tableName = $columns[0] ?? 'table';
+        sort($columns);
+
+        // Handle special cases
+        switch ($type) {
+            case 'spatial':
+                return sprintf('%s_%s_spatialindex', $tableName, implode('_', $columns));
+            case 'hash':
+                return sprintf('%s_%s_hashindex', $tableName, implode('_', $columns));
+            case 'unique':
+                return sprintf('%s_%s_unique', $tableName, implode('_', $columns));
+            default:
+                return sprintf('%s_%s_index', $tableName, implode('_', $columns));
+        }
+    }
+
+    /**
+     * Parse a foreign key definition line
+     */
+    protected function parseForeignKeyDefinition(string $line): array
+    {
+        $definition = [];
+
+        // Foreign key patterns
+        $patterns = [
+            // 1. Klasik foreign tanımı
+            // $table->foreign('user_id')->references('id')->on('users')
+            '/\$table->foreign\([\'"]([^\'"]+)[\'"]\)->references\([\'"]([^\'"]+)[\'"]\)->on\([\'"]([^\'"]+)[\'"]\)((?:->.*?)*)/'
+            => function ($matches) {
+                return [
+                    'type' => 'foreign',
+                    'column' => $matches[1],
+                    'references' => $matches[2],
+                    'on' => $matches[3],
+                    'modifiers' => $this->parseForeignKeyModifiers($matches[4] ?? '')
+                ];
+            },
+
+            // 2. foreignId ile tanımlama
+            // $table->foreignId('user_id')->constrained()
+            '/\$table->foreignId\([\'"]([^\'"]+)[\'"]\)(?:->constrained\((?:[\'"]([^\'"]+)[\'"]\))?)?((?:->.*?)*)/'
+            => function ($matches) {
+                $column = $matches[1];
+                $table = $matches[2] ?? Str::plural(preg_replace('/_id$/', '', $column));
+                return [
+                    'type' => 'foreignId',
+                    'column' => $column,
+                    'references' => 'id',
+                    'on' => $table,
+                    'modifiers' => $this->parseForeignKeyModifiers($matches[3] ?? '')
+                ];
+            },
+
+            // 3. foreignUuid ile tanımlama
+            // $table->foreignUuid('user_id')->constrained()
+            '/\$table->foreignUuid\([\'"]([^\'"]+)[\'"]\)(?:->constrained\((?:[\'"]([^\'"]+)[\'"]\))?)?((?:->.*?)*)/'
+            => function ($matches) {
+                $column = $matches[1];
+                $table = $matches[2] ?? Str::plural(preg_replace('/_id$/', '', $column));
+                return [
+                    'type' => 'foreignUuid',
+                    'column' => $column,
+                    'references' => 'id',
+                    'on' => $table,
+                    'modifiers' => $this->parseForeignKeyModifiers($matches[3] ?? '')
+                ];
+            }
+        ];
+
+        foreach ($patterns as $pattern => $handler) {
+            if (preg_match($pattern, $line, $matches)) {
+                $parsed = $handler($matches);
+                return array_merge($parsed, ['original' => $line]);
+            }
+        }
+
+        return $definition;
+    }
+
+    protected function parseForeignKeyModifiers(string $modifiers): array
+    {
+        $parsed = [];
+
+        // onDelete modifier
+        if (preg_match('/->onDelete\([\'"]([^\'"]+)[\'"]\)/', $modifiers, $matches)) {
+            $parsed['onDelete'] = $matches[1];
+        }
+
+        // onUpdate modifier
+        if (preg_match('/->onUpdate\([\'"]([^\'"]+)[\'"]\)/', $modifiers, $matches)) {
+            $parsed['onUpdate'] = $matches[1];
+        }
+
+        // cascadeOnDelete shorthand
+        if (strpos($modifiers, '->cascadeOnDelete()') !== false) {
+            $parsed['onDelete'] = 'cascade';
+        }
+
+        // nullOnDelete shorthand
+        if (strpos($modifiers, '->nullOnDelete()') !== false) {
+            $parsed['onDelete'] = 'set null';
+        }
+
+        // restrictOnDelete shorthand
+        if (strpos($modifiers, '->restrictOnDelete()') !== false) {
+            $parsed['onDelete'] = 'restrict';
+        }
+
+        return $parsed;
+    }
+
+    protected function generateForeignKeySQL(string $table, array $foreignKey): string
+    {
+        $onDelete = $foreignKey['modifiers']['onDelete'] ?? 'restrict';
+        $onUpdate = $foreignKey['modifiers']['onUpdate'] ?? 'restrict';
+
+        return sprintf(
+            "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`) ON DELETE %s ON UPDATE %s",
+            $table,
+            $this->generateForeignKeyName($table, $foreignKey),
+            $foreignKey['column'],
+            $foreignKey['on'],
+            $foreignKey['references'],
+            strtoupper($onDelete),
+            strtoupper($onUpdate)
+        );
+    }
+
+    protected function generateForeignKeyName(string $table, array $foreignKey): string
+    {
+        return sprintf(
+            '%s_%s_%s_foreign',
+            $table,
+            $foreignKey['column'],
+            $foreignKey['on']
+        );
+    }
+
+    /**
+     * Get all tables from database
+     */
+    protected function getAllTables(): array
+    {
+        $migrationFiles = File::glob(database_path('migrations/*_create_*_table.php'));
+
+        $tables = [];
+        foreach ($migrationFiles as $file) {
+            preg_match('/\d{4}_\d{2}_\d{2}_\d{6}_create_(.+)_table\.php/', basename($file), $matches);
+            if (!empty($matches[1])) {
+                $tables[] = $matches[1];
+            }
+        }
+
+        return $tables;
+    }
+
+    /**
+     * Parse parameters from migration definition
+     */
+    protected function parseParameters(string $paramsStr): array
+    {
+        $params = [];
+        if (empty($paramsStr)) return $params;
+
+        // Handle array parameters like in enum
+        if (strpos($paramsStr, '[') !== false) {
+            preg_match_all('/[\'"]([^\'"]+)[\'"]/', $paramsStr, $matches);
+            return $matches[1] ?? [];
+        }
+
+        // Handle regular parameters
+        preg_match_all('/(?:\'([^\']+)\'|"([^"]+)"|(\d+(?:\.\d+)?))/', $paramsStr, $matches);
+        foreach ($matches[0] as $match) {
+            $params[] = is_numeric($match) ? $match : trim($match, "'\"");
+        }
+
+        return $params;
+    }
+
+    /**
+     * Extract parameters from migration matches
+     */
+    protected function extractParams(array $matches, array $definition): array
+    {
+        $params = [];
+
+        if (empty($matches['params'])) {
+            if (isset($definition['default_length'])) {
+                $params[] = $definition['default_length'];
+            }
+            return $params;
+        }
+
+        $rawParams = $matches['params'];
+
+        // Handle array parameters
+        if (strpos($rawParams, '[') !== false) {
+            preg_match_all('/[\'"]([^\'"]+)[\'"]/', $rawParams, $paramMatches);
+            return $paramMatches[1] ?? [];
+        }
+
+        // Handle regular parameters
+        foreach (explode(',', $rawParams) as $param) {
+            $param = trim($param);
+            if (empty($param)) continue;
+
+            // Handle numeric values
+            if (is_numeric($param)) {
+                $params[] = $param;
+                continue;
+            }
+
+            // Handle quoted strings
+            $params[] = trim($param, "'\"");
+        }
+
+        return $params;
+    }
+
+    /**
+     * Extract modifiers from migration matches
+     */
+    protected function extractModifiers(string $modifiersStr, array $allowedModifiers = []): array
+    {
+        $modifiers = [];
+        if (empty($modifiersStr)) {
+            return $modifiers;
+        }
+
+        // Extract modifier methods without parameters
+        preg_match_all('/->([a-zA-Z]+)\(\)/', $modifiersStr, $matches);
+        foreach ($matches[1] as $modifier) {
+            if (empty($allowedModifiers) || in_array($modifier, $allowedModifiers)) {
+                $modifiers[$modifier] = true;
+            }
+        }
+
+        // Extract modifier methods with parameters
+        preg_match_all('/->([a-zA-Z]+)\((.*?)\)/', $modifiersStr, $matches, PREG_SET_ORDER);
+        foreach ($matches as $match) {
+            $modifier = $match[1];
+            if (empty($allowedModifiers) || in_array($modifier, $allowedModifiers)) {
+                $value = trim($match[2], "'\"");
+                $modifiers[$modifier] = $value ?: true;
+            }
+        }
+
+        return $modifiers;
+    }
+
+    /**
+     * Parse column modifiers (nullable, unsigned, etc.)
+     */
+    protected function parseModifiers(string $modifiers): array
+    {
+        $parsed = [];
+        if (empty($modifiers)) {
+            return $parsed;
+        }
+
+        // Add support for all modifier combinations
+        $modifierPatterns = [
+            'nullable' => '/->nullable\(\)/',
+            'unsigned' => '/->unsigned\(\)/',
+            'unique' => '/->unique\(\)/',
+            'index' => '/->index\(\)/',
+            'default' => '/->default\((.*?)\)/',
+            'charset' => '/->charset\([\'"]([^\'"]+)[\'"]\)/',
+            'collation' => '/->collation\([\'"]([^\'"]+)[\'"]\)/',
+            'comment' => '/->comment\([\'"]([^\'"]+)[\'"]\)/',
+            'after' => '/->after\([\'"]([^\'"]+)[\'"]\)/',
+        ];
+
+        foreach ($modifierPatterns as $modifier => $pattern) {
+            if (preg_match($pattern, $modifiers, $matches)) {
+                if (isset($matches[1])) {
+                    $parsed[$modifier] = trim($matches[1], "'\"");
+                } else {
+                    $parsed[$modifier] = true;
+                }
+            }
+        }
+
+        return $parsed;
+    }
+
+    /**
+     * Add a new column to the table
+     */
+    protected function addColumn(string $table, array $column): void
+    {
+        $sql = $this->generateAddColumnSQL($table, $column);
+        $this->line("  Executing: " . $sql);
+        DB::statement($sql);
+    }
+
+    /**
+     * Drop a column from the table
+     */
+    protected function dropColumn(string $table, string $column): void
+    {
+        $sql = $this->generateDropColumnSQL($table, $column);
+        $this->line("  Executing: " . $sql);
+        DB::statement($sql);
+    }
+
+    /**
+     * Modify an existing column
+     */
+    protected function modifyColumn(string $table, array $column): void
+    {
+        $sql = $this->generateAlterColumnSQL($table, $column);
+        $this->line("  Executing: " . $sql);
+        DB::statement($sql);
+    }
+
+    protected $laravelSpecialColumns = [
+        'created_at' => [
+            'type' => 'timestamp',
+            'nullable' => true,
+            'alternatives' => ['created', 'creation_date', 'date_created', 'create_time']
+        ],
+        'updated_at' => [
+            'type' => 'timestamp',
+            'nullable' => true,
+            'alternatives' => ['updated', 'last_update', 'modified_at', 'last_modified']
+        ],
+        'deleted_at' => [
+            'type' => 'timestamp',
+            'nullable' => true,
+            'alternatives' => ['deleted', 'deletion_date', 'date_deleted']
+        ],
+        'id' => [
+            'type' => 'bigint',
+            'unsigned' => true,
+            'autoIncrement' => true,
+            'primary' => true,
+            'alternatives' => ['uid', 'uuid', 'guid']
+        ]
+    ];
 
     /**
      * Generate SQL to drop a column
-     *
-     * @param string $table
-     * @param string $columnName
-     * @return string
      */
-    protected function generateDropColumnSQL(string $table, string $columnName): string
+    protected function generateDropColumnSQL(string $table, string $column): string
     {
-        return "ALTER TABLE `{$table}` DROP COLUMN `{$columnName}`";
+        // Don't drop special Laravel columns
+        foreach ($this->laravelSpecialColumns as $specialColumn => $info) {
+            if (
+                $column === $specialColumn ||
+                (isset($info['alternatives']) && in_array($column, $info['alternatives']))
+            ) {
+                $this->warn("    Skipping drop of special column: {$column}");
+                return '';
+            }
+        }
+        return "ALTER TABLE `{$table}` DROP COLUMN `{$column}`";
     }
 
     /**
-     * Get columns for table from database
-     *
-     * @param string $table
-     * @return array
+     * Generate SQL to add a column
      */
-    protected function getTableColumns(string $table): array
+    protected function generateAddColumnSQL(string $table, array $column): string
     {
-        return DB::select("SHOW FULL COLUMNS FROM `{$table}`");
+        $type = $this->mapLaravelTypeToMySQLType($column['type'], $column['params'] ?? []);
+        $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
+        $default = '';
+
+        if (isset($column['modifiers']['default'])) {
+            $value = $column['modifiers']['default'];
+            if (is_numeric($value)) {
+                $default = "DEFAULT {$value}";
+            } else {
+                $default = "DEFAULT '" . addslashes($value) . "'";
+            }
+        }
+        return "ALTER TABLE `{$table}` ADD COLUMN `{$column['name']}` {$type} {$nullable} {$default}";
     }
 
     /**
-     * Get indexes for table from database
-     *
-     * @param string $table
-     * @return array
+     * Generate SQL to alter a column
      */
-    protected function getTableIndexes(string $table): array
+    protected function generateAlterColumnSQL(string $table, array $column): string
     {
-        return DB::select("SHOW INDEXES FROM `{$table}`");
+        // Don't modify special Laravel columns
+        foreach ($this->laravelSpecialColumns as $specialColumn => $info) {
+            if (
+                $column['name'] === $specialColumn ||
+                (isset($info['alternatives']) && in_array($column['name'], $info['alternatives']))
+            ) {
+                $this->warn("    Skipping modification of special column: {$column['name']}");
+                return '';
+            }
+        }
+
+        // Check if the column type is a modifier rather than a real type
+        $type = $column['type'];
+        if (in_array(strtolower($type), ['unique', 'index', 'primary'])) {
+            // If it's a modifier, look up the actual existing column type from database
+            $existingColumn = DB::select("SHOW COLUMNS FROM `{$table}` WHERE Field = ?", [$column['name']]);
+            if (!empty($existingColumn)) {
+                $type = $existingColumn[0]->Type;
+            } else {
+                $type = 'varchar(255)'; // Default fallback
+            }
+        } else {
+            // Standard mapping for normal types
+            $type = $this->mapLaravelTypeToMySQLType($type, $column['params'] ?? []);
+        }
+
+        $nullable = isset($column['modifiers']['nullable']) ? 'NULL' : 'NOT NULL';
+        $default = '';
+
+        if (isset($column['modifiers']['default'])) {
+            $value = $column['modifiers']['default'];
+            if (is_numeric($value)) {
+                $default = "DEFAULT {$value}";
+            } else {
+                $default = "DEFAULT '" . addslashes($value) . "'";
+            }
+        }
+
+        // Basic ALTER statement without constraints
+        $sql = "ALTER TABLE `{$table}` MODIFY COLUMN `{$column['name']}` {$type} {$nullable} {$default}";
+
+        // Add unique constraint in separate statement if needed
+        if (isset($column['modifiers']['unique']) && $column['modifiers']['unique']) {
+            $indexName = $column['name'] . '_unique';
+            $sql .= "; ALTER TABLE `{$table}` ADD UNIQUE INDEX `{$indexName}` (`{$column['name']}`)";
+        }
+
+        return $sql;
     }
 
     /**
-     * Check if an index needs to be updated
-     *
-     * @param array $migrationIndex
-     * @param array $existingIndex
-     * @return bool
+     * Check if a column is a Laravel special column
      */
-    protected function indexNeedsUpdate(array $migrationIndex, array $existingIndex): bool
+    protected function isSpecialColumn(string $columnName): bool
     {
-        // Check if index type is different (unique vs. normal)
-        if ($migrationIndex['type'] === 'unique' && !$existingIndex['unique']) {
-            $this->line("    * Index {$migrationIndex['name']}: Type mismatch - Migration: UNIQUE, Current: INDEX");
-            return true;
+        foreach ($this->laravelSpecialColumns as $specialColumn => $info) {
+            if (
+                $columnName === $specialColumn ||
+                (isset($info['alternatives']) && in_array($columnName, $info['alternatives']))
+            ) {
+                return true;
+            }
         }
-        
-        if ($migrationIndex['type'] !== 'unique' && $existingIndex['unique']) {
-            $this->line("    * Index {$migrationIndex['name']}: Type mismatch - Migration: INDEX, Current: UNIQUE");
-            return true;
-        }
-        
-        // Check if index columns are different
-        $migrationColumns = $migrationIndex['columns'];
-        $existingColumns = $existingIndex['columns'];
-        sort($migrationColumns);
-        sort($existingColumns);
-                
-        if ($migrationColumns !== $existingColumns) {
-            $migrationColumnsList = implode(', ', $migrationColumns);
-            $existingColumnsList = implode(', ', $existingColumns);
-            $this->line("    * Index {$migrationIndex['name']}: Columns mismatch - Migration: [{$migrationColumnsList}], Current: [{$existingColumnsList}]");
-            return true;
-        }
-        
         return false;
     }
 
     /**
-     * Generate SQL to add a new index
-     *
-     * @param string $table
-     * @param array $index
-     * @return string
+     * Check if a column should be preserved
      */
-    protected function generateAddIndexSQL(string $table, array $index): string
+    protected function shouldPreserveColumn(string $columnName, bool $hasTimestamps): bool
     {
-        $columns = '`' . implode('`, `', $index['columns']) . '`';
-        $indexType = $index['type'] === 'unique' ? 'UNIQUE' : '';
-        $indexName = $index['name'];
-        
-        return "ALTER TABLE `{$table}` ADD {$indexType} INDEX `{$indexName}` ({$columns})";
-    }
-
-    /**
-     * Generate SQL to drop an index
-     *
-     * @param string $table
-     * @param string $indexName
-     * @return string
-     */
-    protected function generateDropIndexSQL(string $table, string $indexName): string
-    {
-        return "ALTER TABLE `{$table}` DROP INDEX `{$indexName}`";
-    }
-
-    /**
-     * Group indexes by name
-     *
-     * @param array $indexes
-     * @return array
-     */
-    protected function groupIndexes(array $indexes): array
-    {
-        $grouped = [];
-        foreach ($indexes as $index) {
-            $name = $index->Key_name;
-            if ($name === 'PRIMARY') {
-                continue; // Skip primary key
-            }
-            
-            if (!isset($grouped[$name])) {
-                $grouped[$name] = [
-                    'type' => $index->Index_type,
-                    'columns' => [],
-                    'unique' => ($index->Non_unique == 0)
-                ];
-            }
-            $grouped[$name]['columns'][] = $index->Column_name;
+        // Always preserve primary key
+        if ($columnName === 'id') {
+            return true;
         }
-        return $grouped;
+
+        // Preserve timestamp columns if timestamps are used
+        if ($hasTimestamps && in_array($columnName, ['created_at', 'updated_at'])) {
+            return true;
+        }
+
+        // Check other special columns
+        foreach ($this->laravelSpecialColumns as $specialColumn => $info) {
+            if (
+                $columnName === $specialColumn ||
+                (isset($info['alternatives']) && in_array($columnName, $info['alternatives']))
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
-     * Handle special column naming conventions and alternatives
-     *
-     * @param string $columnName
-     * @return bool|string Returns false if not a special column, or the canonical name if it is
+     * Map Laravel type to MySQL type
      */
-    protected function detectSpecialColumn(string $columnName): bool|string
+    protected function mapLaravelTypeToMySQLType(string $type, array $params = []): string
     {
-        // Special timestamp columns including SoftDeletes
-        $specialColumns = [
-            'created_at' => ['created', 'creation_date', 'date_created', 'create_time', 'created_time'],
-            'updated_at' => ['updated', 'last_update', 'date_updated', 'update_time', 'updated_time', 'modified'],
-            'deleted_at' => ['deleted', 'deletion_date', 'date_deleted', 'delete_time', 'deleted_time']  // Yeni eklendi
+        // Handle unsigned integer variants first
+        $unsignedTypes = [
+            'unsignedtinyinteger' => 'tinyint unsigned',
+            'unsignedsmallinteger' => 'smallint unsigned',
+            'unsignedmediuminteger' => 'mediumint unsigned',
+            'unsignedinteger' => 'int unsigned',
+            'unsignedbiginteger' => 'bigint unsigned'
         ];
-        
-        foreach ($specialColumns as $standard => $alternatives) {
-            if ($columnName === $standard || in_array(strtolower($columnName), $alternatives)) {
-                return $standard;
+
+        $lowerType = strtolower($type);
+        if (isset($unsignedTypes[$lowerType])) {
+            return $unsignedTypes[$lowerType];
+        }
+
+        if (isset($this->columnTypes[$type])) {
+            $typeInfo = $this->columnTypes[$type];
+            $mysqlType = $typeInfo['mysql_type'];
+
+            // Add length if defined
+            if (isset($params[0]) && in_array('length', $typeInfo['allows'] ?? [])) {
+                return "{$mysqlType}({$params[0]})";
             }
+
+            // Add default length if defined
+            if (isset($typeInfo['default_length'])) {
+                return "{$mysqlType}({$typeInfo['default_length']})";
+            }
+
+            return $mysqlType;
         }
-        
-        // Special ID columns (not foreign keys)
-        $idAlternatives = ['uid', 'uuid', 'guid', 'identifier'];
-        if (in_array(strtolower($columnName), $idAlternatives)) {
-            return 'id';
+
+        // Handle decimal and float types with precision and scale
+        switch ($lowerType) {
+            case 'decimal':
+            case 'unsigneddecimal':
+                $precision = $params['precision'] ?? 8;
+                $scale = $params['scale'] ?? 2;
+                return "decimal({$precision},{$scale})" .
+                    (strpos($lowerType, 'unsigned') === 0 ? ' unsigned' : '');
+
+            case 'float':
+            case 'double':
+                if (isset($params['precision']) && isset($params['scale'])) {
+                    return "{$lowerType}({$params['precision']},{$params['scale']})";
+                }
+                return $lowerType;
         }
-        
-        return false;
+
+        // Handle enum and set types
+        if (in_array($lowerType, ['enum', 'set'])) {
+            if (!empty($params['values'])) {
+                $values = array_map(function ($val) {
+                    return "'" . addslashes($val) . "'";
+                }, $params['values']);
+                return "{$lowerType}(" . implode(',', $values) . ")";
+            }
+            // Fallback if no values provided
+            return 'varchar(255)';
+        }
+
+        // Fallback for unknown types - ensure we return valid MySQL types
+        if (strpos($lowerType, 'integer') !== false) {
+            return 'int' . (strpos($lowerType, 'unsigned') === 0 ? ' unsigned' : '');
+        }
+
+        return strtolower($type);
     }
 
     /**
-     * Generate a standard index name when none is provided
-     *
-     * @param string $type
-     * @param array $columns
-     * @return string
+     * Drop all foreign keys from a table
      */
-    protected function generateIndexName(string $type, array $columns): string
+    protected function dropTableForeignKeys(string $table): void
     {
-        $prefix = $type === 'unique' ? 'unique' : 'index';
-        
-        // For composite indexes, use all column names
-        if (count($columns) > 1) {
-            return $prefix . '_' . implode('_', $columns);
+        $foreignKeys = $this->getTableForeignKeys($table);
+        foreach ($foreignKeys as $fk) {
+            if ($this->checkConstraintExists($table, $fk->CONSTRAINT_NAME)) {
+                DB::statement("ALTER TABLE `{$table}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`");
+                $this->line("    * Dropped foreign key {$fk->CONSTRAINT_NAME}");
+            }
         }
-        
-        return $prefix . '_' . $columns[0];
+
+        // Also drop foreign keys that reference this table
+        $referencingForeignKeys = $this->getReferencingForeignKeys($table);
+        foreach ($referencingForeignKeys as $fk) {
+            if ($this->checkConstraintExists($fk->TABLE_NAME, $fk->CONSTRAINT_NAME)) {
+                DB::statement("ALTER TABLE `{$fk->TABLE_NAME}` DROP FOREIGN KEY `{$fk->CONSTRAINT_NAME}`");
+                $this->line("    * Dropped foreign key {$fk->CONSTRAINT_NAME} from {$fk->TABLE_NAME}");
+            }
+        }
+    }
+
+    /**
+     * Recreate table indexes and foreign keys
+     */
+    protected function recreateTableIndexesAndForeignKeys(string $table, array $changes): void
+    {
+        // First recreate indexes
+        foreach ($changes['add_indexes'] ?? [] as $index) {
+            if ($sql = $this->generateAddIndexSQL($table, $index)) {
+                DB::statement($sql);
+                $this->line("    * Recreated index {$index['name']}");
+            }
+        }
+
+        // Then recreate foreign keys
+        $foreignKeys = $this->getTableForeignKeys($table);
+        foreach ($foreignKeys as $fk) {
+            if ($this->shouldRecreateConstraint($fk, $changes)) {
+                $sql = sprintf(
+                    "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
+                    $table,
+                    $fk->CONSTRAINT_NAME,
+                    $fk->COLUMN_NAME,
+                    $fk->REFERENCED_TABLE_NAME,
+                    $fk->REFERENCED_COLUMN_NAME
+                );
+                DB::statement($sql);
+                $this->line("    * Recreated foreign key {$fk->CONSTRAINT_NAME}");
+            }
+        }
+
+        // Recreate foreign keys that reference this table
+        $referencingForeignKeys = $this->getReferencingForeignKeys($table);
+        foreach ($referencingForeignKeys as $fk) {
+            if ($this->shouldRecreateConstraint($fk, $changes)) {
+                $sql = sprintf(
+                    "ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
+                    $fk->TABLE_NAME,
+                    $fk->CONSTRAINT_NAME,
+                    $fk->COLUMN_NAME,
+                    $table,
+                    $fk->REFERENCED_COLUMN_NAME
+                );
+                DB::statement($sql);
+                $this->line("    * Recreated foreign key {$fk->CONSTRAINT_NAME} on {$fk->TABLE_NAME}");
+            }
+        }
     }
 
     /**
      * Get foreign keys for a table
-     *
-     * @param string $table
-     * @return array
      */
     protected function getTableForeignKeys(string $table): array
     {
-        try {
-            return DB::select("
-                SELECT 
-                    CONSTRAINT_NAME,
-                    COLUMN_NAME,
-                    REFERENCED_TABLE_NAME,
-                    REFERENCED_COLUMN_NAME
-                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE 
-                    TABLE_SCHEMA = ? AND
-                    TABLE_NAME = ? AND
-                    REFERENCED_TABLE_NAME IS NOT NULL
-            ", [config('database.connections.mysql.database'), $table]);
-        } catch (\Exception $e) {
-            $this->warn("  Could not retrieve foreign key information: " . $e->getMessage());
-            return [];
-        }
+        return DB::select("
+            SELECT 
+                CONSTRAINT_NAME,
+                COLUMN_NAME,
+                REFERENCED_TABLE_NAME,
+                REFERENCED_COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE 
+                TABLE_SCHEMA = ? AND
+                TABLE_NAME = ? AND
+                REFERENCED_TABLE_NAME IS NOT NULL
+        ", [$this->getDatabaseName(), $table]);
     }
 
     /**
-     * Extract index names that are used by foreign keys
-     *
-     * @param array $foreignKeys
-     * @return array
+     * Get foreign keys that reference this table
      */
-    protected function extractForeignKeyIndexes(array $foreignKeys): array
+    protected function getReferencingForeignKeys(string $table): array
     {
-        $indexes = [];
-        foreach ($foreignKeys as $fk) {
-            // Standard MySQL foreign key index naming
-            $indexes[] = $fk->CONSTRAINT_NAME;
-            
-            // Laravel's standard foreign key index naming patterns
-            $indexes[] = $this->currentTable . '_' . $fk->COLUMN_NAME . '_foreign';
-            $indexes[] = $fk->COLUMN_NAME . '_foreign'; // Bazı durumlarda tablo adı olmadan
-            $indexes[] = 'fk_' . $this->currentTable . '_' . $fk->COLUMN_NAME; // Alternatif naming pattern
-            
-            // Tek sütunlu unique index durumu
-            $indexes[] = 'idx_' . $this->currentTable . '_' . $fk->COLUMN_NAME;
-            $indexes[] = 'idx_' . $fk->COLUMN_NAME;
-        }
-        return array_unique($indexes);
+        return DB::select("
+            SELECT 
+                CONSTRAINT_NAME,
+                TABLE_NAME,
+                COLUMN_NAME,
+                REFERENCED_TABLE_NAME,
+                REFERENCED_COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE 
+                TABLE_SCHEMA = ? AND
+                REFERENCED_TABLE_NAME = ?
+        ", [config('database.connections.mysql.database'), $table]);
     }
 
     /**
-     * Get foreign key constraints for a specific column
-     *
-     * @param string $table
-     * @param string $column
-     * @return array
+     * Generate SQL to drop an index
      */
-    protected function getForeignKeyConstraints(string $table, string $column): array
+    protected function generateDropIndexSQL(string $table, string $indexName): string
     {
-        try {
-            return DB::select("
-                SELECT 
-                    CONSTRAINT_NAME,
-                    COLUMN_NAME,
-                    REFERENCED_TABLE_NAME,
-                    REFERENCED_COLUMN_NAME
-                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE 
-                    TABLE_SCHEMA = ? AND
-                    TABLE_NAME = ? AND
-                    COLUMN_NAME = ? AND
-                    REFERENCED_TABLE_NAME IS NOT NULL
-            ", [
-                config('database.connections.mysql.database'),
-                $table,
-                $column
-            ]);
-        } catch (\Exception $e) {
-            $this->warn("  Could not retrieve foreign key constraint information: " . $e->getMessage());
-            return [];
+        $indexes = DB::select("SHOW INDEXES FROM `{$table}` WHERE Key_name = ?", [$indexName]);
+        if (empty($indexes)) {
+            return '';
         }
+
+        if ($this->checkConstraintExists($table, $indexName)) {
+            return "ALTER TABLE `{$table}` DROP FOREIGN KEY `{$indexName}`";
+        }
+
+        return "ALTER TABLE `{$table}` DROP INDEX `{$indexName}`";
     }
 
     /**
-     * Execute a batch of SQL statements with proper error handling
-     *
-     * @param array $statements
-     * @param bool $continueOnError
-     * @return array [bool $success, int $completed]
+     * Generate SQL to add an index
      */
-    protected function executeBatchStatements(array $statements, bool $continueOnError = true): array
+    protected function generateAddIndexSQL(string $table, array $index): string
     {
-        $success = true;
-        $completed = 0;
+        if ($this->checkIndexExists($table, $index['columns'], $index['type'] === 'unique')) {
+            return '';
+        }
 
-        foreach ($statements as $sql) {
-            try {
-                $this->line("    - " . $sql);
-                DB::statement($sql);
-                $completed++;
-            } catch (\Exception $e) {
-                $this->error("    ! Error executing SQL: " . $e->getMessage());
-                
-                if (!$continueOnError) {
-                    return [false, $completed];
-                }
-                
-                $success = false;
+        return sprintf(
+            'ALTER TABLE `%s` ADD %s INDEX `%s` (`%s`)',
+            $table,
+            $index['type'] === 'unique' ? 'UNIQUE' : '',
+            $index['name'],
+            implode('`, `', $index['columns'])
+        );
+    }
+
+    /**
+     * Check if an index exists
+     */
+    protected function checkIndexExists(string $table, array $columns, bool $isUnique = false): bool
+    {
+        $columns = array_map(fn($col) => trim(trim($col, "'\""), ' '), $columns);
+        sort($columns);
+
+        $indexes = DB::select("SHOW INDEXES FROM `{$table}`");
+        $groupedIndexes = [];
+
+        foreach ($indexes as $index) {
+            $keyName = $index->Key_name;
+            if (!isset($groupedIndexes[$keyName])) {
+                $groupedIndexes[$keyName] = [
+                    'columns' => [],
+                    'unique' => $index->Non_unique == 0
+                ];
+            }
+            $groupedIndexes[$keyName]['columns'][] = $index->Column_name;
+        }
+
+        foreach ($groupedIndexes as $indexInfo) {
+            sort($indexInfo['columns']);
+            if ($columns === $indexInfo['columns'] && $isUnique === $indexInfo['unique']) {
+                return true;
             }
         }
 
-        return [$success, $completed];
+        return false;
     }
+
+    /**
+     * Check if a constraint exists
+     */
+    protected function checkConstraintExists(string $table, string $constraintName): bool
+    {
+        $constraints = DB::select("
+            SELECT CONSTRAINT_NAME 
+            FROM information_schema.TABLE_CONSTRAINTS 
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = ?
+        ", [$this->getDatabaseName(), $table, $constraintName]);
+
+        return !empty($constraints);
+    }
+
+    /**
+     * Check if two database types match, with support for length and other attributes
+     */
+    /**
+     * Check if Laravel column type matches with MySQL type
+     *
+     * @param string $laravelType The column type from Laravel migration
+     * @param string $mysqlType The column type from MySQL database
+     * @return bool Whether the types are equivalent
+     */
+    protected function typesMatch(string $laravelType, string $mysqlType): bool
+    {
+        // Normalize types to lowercase for comparison
+        $laravelType = strtolower($laravelType);
+        $mysqlType = strtolower($mysqlType);
+
+        // Skip modifiers that aren't actual column types
+        if ($this->isModifier($laravelType)) {
+            return true;
+        }
+
+        // Handle special case for ID type
+        if ($laravelType === 'id' && $mysqlType === 'bigint unsigned') {
+            return true;
+        }
+
+        // Check unsigned type variations
+        if ($this->matchesUnsignedType($laravelType, $mysqlType)) {
+            return true;
+        }
+
+        // Parse MySQL type into components
+        $mysqlTypeComponents = $this->parseMySQLType($mysqlType);
+
+        // Check if types are equivalent based on type mappings
+        return $this->typesAreEquivalent(
+            $laravelType,
+            $mysqlTypeComponents['baseType'],
+            $mysqlTypeComponents['attributes']
+        );
+    }
+
+    /**
+     * Check if the type is a modifier rather than an actual column type
+     */
+    private function isModifier(string $type): bool
+    {
+        return in_array($type, ['unique', 'index', 'primary']);
+    }
+
+    /**
+     * Check if Laravel unsigned type matches MySQL unsigned type
+     */
+    private function typesAreEquivalent(string $laravelType, string $mysqlBaseType, string $attributes): bool
+    {
+        $equivalents = [
+            'string' => ['varchar', 'char'],
+            'text' => ['text', 'mediumtext', 'longtext'],
+            'integer' => ['int', 'integer'],
+            'biginteger' => ['bigint'],
+            'tinyinteger' => ['tinyint'],
+            'smallinteger' => ['smallint'],
+            'mediuminteger' => ['mediumint'],
+            'boolean' => ['tinyint', 'bool', 'boolean'],
+            'decimal' => ['decimal', 'numeric'],
+            'float' => ['float', 'double'],
+            'timestamp' => ['timestamp', 'datetime'],
+            'binary' => ['blob', 'binary'],
+            'foreignid' => ['bigint unsigned'],
+        ];
+
+        if (isset($equivalents[$laravelType])) {
+            $baseTypeMatches = in_array($mysqlBaseType, $equivalents[$laravelType]);
+
+            // For unsigned types, also check attributes
+            if ($baseTypeMatches && strpos($laravelType, 'unsigned') !== false) {
+                return strpos($attributes, 'unsigned') !== false;
+            }
+
+            return $baseTypeMatches;
+        }
+
+        // Handle enum and set types
+        if (($laravelType === 'enum' || $laravelType === 'set') && function_exists('strpos')) {
+            return $laravelType === $mysqlBaseType;
+        }
+
+        return $laravelType === $mysqlBaseType;
+    }
+
+    /**
+     * Check if we should recreate a constraint
+     */
+    protected function shouldRecreateConstraint($constraint, array $changes): bool
+    {
+        // Implementation depends on your specific needs
+        return true; // Default to always recreate
+    }
+
+
+
+    protected function extractDefaultValue(string $modifiers): ?string
+    {
+        if (preg_match('/->default\((.*?)\)/', $modifiers, $matches)) {
+            return trim($matches[1], "'\"");
+        }
+        return null;
+    }
+
+    protected function defaultsAreDifferent($default1, $default2): bool
+    {
+        // If both are null or empty strings, they're considered the same
+        if (($default1 === null || $default1 === '') && ($default2 === null || $default2 === '')) {
+            return false;
+        }
+
+        // If one is null and the other isn't
+        if (($default1 === null && $default2 !== null) || ($default1 !== null && $default2 === null)) {
+            return true;
+        }
+
+        // Normalize values by trimming quotes and whitespace
+        $default1 = trim($default1 ?? '', "'\"");
+        $default2 = trim($default2 ?? '', "'\"");
+
+        // Special case for CURRENT_TIMESTAMP
+        if (strtoupper($default1) === 'CURRENT_TIMESTAMP' && strtoupper($default2) === 'CURRENT_TIMESTAMP') {
+            return false;
+        }
+
+        // String comparison
+        return $default1 !== $default2;
+    }
+
+    /**
+     * Parse MySQL type into components
+     */
+    protected function parseMySQLType(string $mysqlType): array
+    {
+        $baseType = $mysqlType;
+        $attributes = '';
+
+        // Extract unsigned attribute
+        if (strpos($mysqlType, 'unsigned') !== false) {
+            $baseType = trim(str_replace('unsigned', '', $mysqlType));
+            $attributes = 'unsigned';
+        }
+
+        // Extract type length/precision if present
+        if (preg_match('/(.+?)\((.+?)\)/', $baseType, $matches)) {
+            $baseType = $matches[1];
+        }
+
+        return [
+            'baseType' => trim($baseType),
+            'attributes' => $attributes
+        ];
+    }
+
+    /**
+     * Check if Laravel unsigned type matches MySQL unsigned type
+     */
+    protected function matchesUnsignedType(string $laravelType, string $mysqlType): bool
+    {
+        if (strpos($laravelType, 'unsigned') === 0) {
+            $baseType = substr($laravelType, 8); // Remove 'unsigned'
+            return strpos($mysqlType, $baseType) !== false &&
+                strpos($mysqlType, 'unsigned') !== false;
+        }
+        return false;
+    }
+
+
+
+    /**
+     * Helper function to access Laravel's config safely
+     */
+    private function getDatabaseName(): string
+    {
+        return \config('database.connections.mysql.database');
+    }
+
+    /**
+     * Apply structure changes to a table (used for temporary table updates)
+     */
+    protected function applyChangesToTable(string $table, array $changes): void
+    {
+        // Drop any foreign keys first
+        $this->dropTableForeignKeys($table);
+
+        // Drop indexes
+        foreach ($changes['drop_indexes'] ?? [] as $index) {
+            if ($sql = $this->generateDropIndexSQL($table, $index)) {
+                DB::statement($sql);
+            }
+        }
+
+        // Drop columns
+        foreach ($changes['drop_columns'] ?? [] as $column) {
+            if ($sql = $this->generateDropColumnSQL($table, $column)) {
+                DB::statement($sql);
+            }
+        }
+
+        // Add new columns
+        foreach ($changes['add_columns'] ?? [] as $column) {
+            if ($sql = $this->generateAddColumnSQL($table, $column)) {
+                DB::statement($sql);
+            }
+        }
+
+        // Modify columns
+        foreach ($changes['modify_columns'] ?? [] as $column) {
+            if ($sql = $this->generateAlterColumnSQL($table, $column)) {
+                DB::statement($sql);
+            }
+        }
+
+        // Add new indexes
+        foreach ($changes['add_indexes'] ?? [] as $index) {
+            if ($sql = $this->generateAddIndexSQL($table, $index)) {
+                DB::statement($sql);
+            }
+        }
+    }
+
+    /**
+     * Check and drop foreign key constraints for a column before modification
+     */
+    protected function dropForeignKeyConstraintsForColumn(string $table, string $column): void
+    {
+        // Find all foreign keys that reference this column
+        $references = DB::select("
+            SELECT 
+                CONSTRAINT_NAME,
+                TABLE_NAME,
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE 
+                TABLE_SCHEMA = ? AND
+                REFERENCED_TABLE_NAME = ? AND
+                REFERENCED_COLUMN_NAME = ?
+        ", [$this->getDatabaseName(), $table, $column]);
+
+        if (!empty($references)) {
+            $this->warn("  Found foreign key constraints referencing column '{$column}' in table '{$table}':");
+            foreach ($references as $ref) {
+                $this->warn("    - {$ref->TABLE_NAME}.{$ref->COLUMN_NAME} (constraint: {$ref->CONSTRAINT_NAME})");
+
+                if ($this->option('force')) {
+                    $this->info("    Dropping foreign key constraint {$ref->CONSTRAINT_NAME} from {$ref->TABLE_NAME} (force mode)");
+                    DB::statement("ALTER TABLE `{$ref->TABLE_NAME}` DROP FOREIGN KEY `{$ref->CONSTRAINT_NAME}`");
+                }
+            }
+
+            if (!$this->option('force')) {
+                throw new \Exception("Cannot drop column with foreign key constraints. Use --force to override.");
+            }
+        }
+    }
+
+    protected function showColumnChanges(array $columns): void
+    {
+        $rows = [];
+        foreach ($columns as $column) {
+            $rows[] = [
+                $column['name'],
+                isset($column['differences']['type']) ? "Type: {$column['differences']['type']['existing']} → {$column['differences']['type']['migration']}" : '',
+                isset($column['differences']['nullable']) ? "Nullable: " . ($column['differences']['nullable']['existing'] ? 'Yes' : 'No') . " → " . ($column['differences']['nullable']['migration'] ? 'Yes' : 'No') : '',
+            ];
+        }
+
+        $this->table(['Column', 'Type Change', 'Nullable Change'], $rows);
+    }
+
+    /**
+     * Display a summary of all operations performed
+     */
+    protected function displaySummary(array $stats): void
+    {
+        $this->output->writeln([
+            '',
+            ' <fg=bright-green>┌───────────────────────────────────┐</>',
+            ' <fg=bright-green>│</> Operation Summary <fg=bright-green>               │</>',
+            ' <fg=bright-green>└───────────────────────────────────┘</>',
+            '',
+            " <fg=white>➤</> Tables Processed:    <fg=green>{$stats['processed']}</> of {$stats['total']}",
+            " <fg=white>➤</> Columns Added:       <fg=green>{$stats['added']}</>",
+            " <fg=white>➤</> Columns Modified:    <fg=green>{$stats['modified']}</>",
+            " <fg=white>➤</> Columns Dropped:     <fg=green>{$stats['dropped']}</>",
+            " <fg=white>➤</> Errors Encountered:  <fg=" . ($stats['errors'] > 0 ? 'red' : 'green') . ">{$stats['errors']}</>",
+            ''
+        ]);
+        
+        // If there were errors, show details
+        if ($stats['errors'] > 0 && !empty($stats['error_details'])) {
+            $this->output->writeln(" <fg=yellow>Error Details:</>");
+            foreach ($stats['error_details'] as $error) {
+                $this->output->writeln(" <fg=red>✗</> {$error['table']}: {$error['message']}");
+            }
+            $this->output->writeln('');
+        }
+        
+        // Show timing information
+        if (isset($stats['duration'])) {
+            $this->output->writeln(" <fg=gray>Total execution time: {$stats['duration']} seconds</>");
+        }
+    }  
 }
